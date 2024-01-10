@@ -507,4 +507,4 @@ jobs:
         uses: actions/upload-artifact@v1
         with:
           name: whisper-server
-          path: server/whisper-server
+          path: build/bin/server
