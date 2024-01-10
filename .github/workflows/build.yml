@@ -117,6 +117,7 @@ jobs:
             -w /workspace ${{ env.ubuntu_image }} /bin/sh -c '
             set -e
             apt update
+            apt install -y clang
             apt install -y clang build-essential cmake libsdl2-dev
             cmake . -DWHISPER_SDL2=ON -DCMAKE_BUILD_TYPE=${{ matrix.build }} -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
             make
@@ -166,7 +167,7 @@ jobs:
             s2arc: x64
             jnaPath: win32-x86-64
           - sdl2: ON
-            s2ver: 2.28.5
+            s2ver: 2.26.0
 
     steps:
       - name: Clone
@@ -223,14 +224,11 @@ jobs:
           - arch: Win32
             obzip: https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.25/OpenBLAS-0.3.25-x86.zip
             s2arc: x86
-            clblast: OFF
           - arch: x64
             obzip: https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.25/OpenBLAS-0.3.25-x64.zip
             s2arc: x64
-            clblast: ON
-            clver: 1.6.1
           - sdl2: ON
-            s2ver: 2.28.5
+            s2ver: 2.26.0
 
     steps:
       - name: Clone
@@ -255,18 +253,6 @@ jobs:
           7z x sdl2.zip
           echo "SDL2_DIR=$env:GITHUB_WORKSPACE/SDL2-${{ matrix.s2ver }}/cmake" >> $env:GITHUB_ENV
 
-      - name: Install OpenCL
-        if: matrix.clblast == 'ON'
-        run: vcpkg.exe --triplet=${{ matrix.arch }}-windows install opencl
-
-      - name: Fetch CLBlast and set CLBlast_DIR
-        if: matrix.clblast == 'ON'
-        run: |
-          C:/msys64/usr/bin/wget.exe -qO clblast.zip https://github.com/CNugteren/CLBlast/releases/download/${{ matrix.clver }}/CLBlast-${{ matrix.clver }}-windows-x64.zip
-          7z x clblast.zip
-          7z x CLBlast-${{ matrix.clver }}-windows-x64.7z
-          echo "CLBlast_DIR=$env:GITHUB_WORKSPACE/CLBlast-${{ matrix.clver }}-windows-x64/lib/cmake/CLBlast" >> $env:GITHUB_ENV
-
       - name: Configure
         run: >
           cmake -S . -B ./build -A ${{ matrix.arch }}
@@ -274,7 +260,6 @@ jobs:
           -DWHISPER_OPENBLAS=${{ matrix.blas }}
           -DCMAKE_LIBRARY_PATH="$env:OPENBLAS_PATH/lib"
           -DWHISPER_SDL2=${{ matrix.sdl2 }}
-          -DWHISPER_CLBLAST=${{ matrix.clblast }}
 
       - name: Build
         run: |
@@ -289,15 +274,11 @@ jobs:
         if: matrix.sdl2 == 'ON'
         run: copy "$env:SDL2_DIR/../lib/${{ matrix.s2arc }}/SDL2.dll" build/bin/${{ matrix.build }}
 
-      - name: Copy clblast.dll
-        if: matrix.clblast == 'ON'
-        run: copy "$env:CLBlast_DIR/../../clblast.dll" build/bin/${{ matrix.build }}
-
       - name: Upload binaries
         if: matrix.blas == 'ON' && matrix.sdl2 == 'ON'
         uses: actions/upload-artifact@v1
         with:
-          name: whisper-blas${{ matrix.clblast == 'ON' && '-clblast' || ''}}-bin-${{ matrix.arch }}
+          name: whisper-blas-bin-${{ matrix.arch }}
           path: build/bin/${{ matrix.build }}
 
   windows-cublas:
@@ -314,7 +295,7 @@ jobs:
           - arch: x64
             s2arc: x64
           - sdl2: ON
-            s2ver: 2.28.5
+            s2ver: 2.26.0
 
     steps:
       - name: Clone
@@ -340,8 +321,7 @@ jobs:
         run: >
           cmake -S . -B ./build -A ${{ matrix.arch }}
           -DCMAKE_BUILD_TYPE=${{ matrix.build }}
-          -DWHISPER_CUBLAS=${{ matrix.cublas }}
-          -DWHISPER_SDL2=${{ matrix.sdl2 }}
+          -DWHISPER_CUBLAS=1
 
       - name: Build ${{ matrix.cuda-toolkit }}
         run: |
@@ -511,3 +491,20 @@ jobs:
           ./models/download-ggml-model.sh tiny.en
           make quantize
           ./quantize models/ggml-tiny.en.bin models/ggml-tiny.en-q4_0.bin q4_0
+
+  server:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v3
+
+      - name: Build server
+        run: |
+          make server
+      
+      - name: Upload server
+        uses: actions/upload-artifact@v1
+        with:
+          name: whisper-server
+          path: server/whisper-server
