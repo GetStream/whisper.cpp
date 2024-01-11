@@ -1,0 +1,41 @@
+name: Build Release
+on:
+  - push
+  - pull_request
+jobs:
+  create-release:
+    runs-on: 'ubuntu-20.04'
+    outputs:
+      upload_url: ${{ steps.create-release.outputs.upload_url }}
+    steps:
+    - name: Create Release
+      id: create-release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: ncipollo/release-action@v1
+      with:
+        omitBody: true
+        prerelease: true
+        token: ${{ secrets.GITHUB_TOKEN }}
+  build:
+    runs-on: ${{ matrix.os }}
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-20.04]
+        platform:
+          - 'linux-x64'
+    
+    steps:
+      - name: Clone
+        uses: actions/checkout@v3
+
+      - name: Build server
+        run: |
+          make server
+      
+      - name: Upload server
+        uses: actions/upload-artifact@v1
+        with:
+          name: whisper-server
+          path: build/bin/server
