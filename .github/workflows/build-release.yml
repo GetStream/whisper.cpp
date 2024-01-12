@@ -1,7 +1,8 @@
 name: Build Release
 on:
-  - push
-  - pull_request
+  release:
+    types:
+      - created
 jobs:
   create-release:
     runs-on: 'ubuntu-20.04'
@@ -10,13 +11,13 @@ jobs:
     steps:
     - name: Create Release
       id: create-release
-      if: startsWith(github.ref, 'refs/tags/v')
       uses: ncipollo/release-action@v1
       with:
         omitBody: true
         prerelease: true
         allowUpdates: true
         token: ${{ secrets.GITHUB_TOKEN }}
+
   build:
     runs-on: ${{ matrix.os }}
     needs: create-release
@@ -40,3 +41,24 @@ jobs:
         with:
           name: whisper-server
           path: server
+
+  upload-release-assets:
+    runs-on: 'ubuntu-20.04'
+    needs: build
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v2
+        with:
+          name: whisper-server
+          path: downloaded-server
+
+      - name: Upload Release Asset
+        id: upload-release-asset
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: downloaded-server/server
+          asset_name: whisper-server
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
