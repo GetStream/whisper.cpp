@@ -44,7 +44,7 @@ jobs:
 
   upload-release-assets:
     runs-on: 'ubuntu-20.04'
-    needs: create-release
+    needs: [create-release, build] 
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v2
