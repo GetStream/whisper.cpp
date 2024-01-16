@@ -35,12 +35,13 @@ jobs:
       - name: Build server
         run: |
           make server
+          mv server whisper-server-amd64
       
       - name: Upload server
         uses: actions/upload-artifact@v1
         with:
-          name: whisper-server
-          path: server
+          name: whisper-server-amd64
+          path: whisper-server-amd64
 
   upload-release-assets:
     runs-on: 'ubuntu-20.04'
@@ -49,7 +50,7 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v2
         with:
-          name: whisper-server
+          name: whisper-server-amd64
           path: downloaded-server
 
       - name: Upload Release Asset
@@ -57,8 +58,8 @@ jobs:
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: downloaded-server/server
-          asset_name: whisper-server
+          asset_path: downloaded-server/whisper-server-amd64
+          asset_name: whisper-server-amd64
           asset_content_type: application/octet-stream
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
