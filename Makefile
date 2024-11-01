@@ -98,13 +98,36 @@ endif
 
 # In GNU make default CXX is g++ instead of c++.  Let's fix that so that users
 # of non-gcc compilers don't have to provide g++ alias or wrapper.
-DEFCC  := gcc
-DEFCXX := g++-10
-ifeq ($(origin CC),default)
-CC  := $(DEFCC)
+# Detect operating system and set compilers accordingly
+ifeq ($(UNAME_S),Linux)
+    DEFCC  := gcc
+    DEFCXX := g++
+
+    # Use g++-10 on Linux if available
+    GCC_VERSION := 10
+    GXX_PATH := /usr/bin/g++-$(GCC_VERSION)
+    ifneq ($(wildcard $(GXX_PATH)),)
+        DEFCXX := $(GXX_PATH)
+    else
+        $(warning g++-$(GCC_VERSION) not found. Using default g++)
+    endif
+else ifeq ($(UNAME_S),Darwin)
+    DEFCC  := cc
+    DEFCXX := c++
 endif
-ifeq ($(origin CXX),default)
-CXX := $(DEFCXX)
+
+# Override CC and CXX if not set
+ifeq ($(origin CC), default)
+    CC  := $(DEFCC)
+endif
+ifeq ($(origin CXX), default)
+    CXX := $(DEFCXX)
+endif
+
+# Enable CUDA only on Linux
+ifeq ($(UNAME_S),Linux)
+    # Uncomment or set GGML_CUDA as needed
+    GGML_CUDA := 1
 endif
 
 # Mac OS + Arm can report x86_64
@@ -873,77 +896,94 @@ $(info I LDFLAGS:   $(LDFLAGS))
 $(info I CC:        $(shell $(CC)   --version | head -n 1))
 $(info I CXX:       $(shell $(CXX)  --version | head -n 1))
 ifdef GGML_CUDA
-    ifneq ('', '$(wildcard /opt/cuda)')
-        CUDA_PATH ?= /opt/cuda
-    else
-        CUDA_PATH ?= /usr/local/cuda
-    endif
+    ifeq ($(UNAME_S),Linux)
+        # CUDA path setup
+        ifneq ('', '$(wildcard /opt/cuda)')
+            CUDA_PATH ?= /opt/cuda
+        else
+            CUDA_PATH ?= /usr/local/cuda
+        endif
 
-    MK_CPPFLAGS += -DGGML_USE_CUDA -I$(CUDA_PATH)/include -I$(CUDA_PATH)/targets/$(UNAME_M)-linux/include
-    MK_LDFLAGS   += -lcuda -lcublas -lculibos -lcudart -lcufft -lcublasLt -lpthread -ldl -lrt -L$(CUDA_PATH)/lib64 -L/usr/lib64 -L$(CUDA_PATH)/targets/$(UNAME_M)-linux/lib -L$(CUDA_PATH)/lib64/stubs -L/usr/lib/wsl/lib
-    MK_NVCCFLAGS += -use_fast_math -Wno-deprecated-gpu-targets -arch=compute_75 \
-                   -DGGML_CUDA_DMMV_X=32 -DGGML_CUDA_MMV_Y=1 \
-                   -DK_QUANTS_PER_ITERATION=2 -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128
+        # Include paths
+        MK_CPPFLAGS += -DGGML_USE_CUDA -I$(CUDA_PATH)/include -I$(CUDA_PATH)/targets/$(UNAME_M)-linux/include
+        MK_CPPFLAGS += -I/usr/local/cuda/include -I/usr/local/cuda/targets/x86_64-linux/include
 
-    # Add additional compiler flags
-    CUDA_CXXFLAGS += -std=c++14 -fPIC -O3 -Wall -Wextra -Wpedantic \
-                      -Wcast-qual -Wno-unused-function -Wmissing-declarations \
-                      -Wmissing-noreturn -pthread -fopenmp -Wno-array-bounds \
-                      -Wno-format-truncation -Wextra-semi -Wno-pedantic
+        # Linker flags
+        MK_LDFLAGS += -lcuda -lcublas -lculibos -lcudart -lcufft -lcublasLt -lpthread -ldl -lrt -L$(CUDA_PATH)/lib64 -L/usr/lib64 -L$(CUDA_PATH)/targets/$(UNAME_M)-linux/lib -L$(CUDA_PATH)/lib64/stubs -L/usr/lib/wsl/lib
 
-    OBJ_GGML += ggml/src/ggml-cuda.o
-    OBJ_GGML += $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/*.cu))
-    OBJ_GGML += $(OBJ_CUDA_TMPL)
+        # NVCC flags
+        MK_NVCCFLAGS += -std=c++14 --expt-relaxed-constexpr -Xcompiler "-std=c++14" --compiler-bindir=$(CXX) -O3 -use_fast_math --forward-unknown-to-host-compiler -Wno-deprecated-gpu-targets -arch=compute_75 \
+                       -DGGML_CUDA_DMMV_X=32 -DGGML_CUDA_MMV_Y=1 -DK_QUANTS_PER_ITERATION=2 -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128
 
-    ifdef WHISPER_FATAL_WARNINGS
-        MK_NVCCFLAGS += -Werror all-warnings
-    endif # WHISPER_FATAL_WARNINGS
+        # Additional compiler flags
+        CUDA_CXXFLAGS += -std=c++14 -fPIC -O3 -Wall -Wextra -Wpedantic \
+                          -Wcast-qual -Wno-unused-function -Wmissing-declarations \
+                          -Wmissing-noreturn -pthread -fopenmp -Wno-array-bounds \
+                          -Wno-format-truncation -Wextra-semi -Wno-pedantic
 
-    ifndef JETSON_EOL_MODULE_DETECT
-        MK_NVCCFLAGS += --forward-unknown-to-host-compiler
-    endif # JETSON_EOL_MODULE_DETECT
+        # Object files
+        OBJ_GGML += ggml/src/ggml-cuda.o
+        OBJ_GGML += $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/*.cu))
+        OBJ_GGML += $(OBJ_CUDA_TMPL)
 
-    ifdef WHISPER_DEBUG
-        MK_NVCCFLAGS += -lineinfo
-    endif # WHISPER_DEBUG
+        # Fatal warnings
+        ifdef WHISPER_FATAL_WARNINGS
+            MK_NVCCFLAGS += -Werror all-warnings
+        endif # WHISPER_FATAL_WARNINGS
 
-    ifdef GGML_CUDA_DEBUG
-        MK_NVCCFLAGS += --device-debug
-    endif # GGML_CUDA_DEBUG
+        # Forward unknown to host compiler
+        ifndef JETSON_EOL_MODULE_DETECT
+            MK_NVCCFLAGS += --forward-unknown-to-host-compiler
+        endif # JETSON_EOL_MODULE_DETECT
 
-    ifdef GGML_CUDA_NVCC
-        NVCC = $(CCACHE) $(GGML_CUDA_NVCC)
-    else
-        NVCC = $(CCACHE) nvcc
-    endif #GGML_CUDA_NVCC
+        # Debug flags
+        ifdef WHISPER_DEBUG
+            MK_NVCCFLAGS += -lineinfo
+        endif # WHISPER_DEBUG
 
-    ifdef CUDA_DOCKER_ARCH
-        MK_NVCCFLAGS += -Wno-deprecated-gpu-targets -arch=$(CUDA_DOCKER_ARCH)
-    else ifndef CUDA_POWER_ARCH
-        MK_NVCCFLAGS += -arch=compute_75
-    endif # CUDA_DOCKER_ARCH
+        ifdef GGML_CUDA_DEBUG
+            MK_NVCCFLAGS += --device-debug
+        endif # GGML_CUDA_DEBUG
 
-    define NVCC_COMPILE
-        $(NVCC) $(MK_NVCCFLAGS) $(MK_CPPFLAGS) -Xcompiler "$(CUDA_CXXFLAGS)" -c $< -o $@
-    endef # NVCC_COMPILE
+        # NVCC definition
+        ifdef GGML_CUDA_NVCC
+            NVCC = $(CCACHE) $(GGML_CUDA_NVCC)
+        else
+            NVCC = $(CCACHE) nvcc
+        endif #GGML_CUDA_NVCC
 
-    ggml/src/ggml-cuda/%.o: \
-        ggml/src/ggml-cuda/%.cu \
-        ggml/include/ggml.h \
-        ggml/src/ggml-common.h \
-        ggml/src/ggml-cuda/common.cuh
-        $(NVCC_COMPILE)
+        # Architecture-specific NVCC flags
+        ifdef CUDA_DOCKER_ARCH
+            MK_NVCCFLAGS += -Wno-deprecated-gpu-targets -arch=$(CUDA_DOCKER_ARCH)
+        else ifndef CUDA_POWER_ARCH
+            MK_NVCCFLAGS += -arch=compute_75
+        endif # CUDA_DOCKER_ARCH
 
-    ggml/src/ggml-cuda.o: \
-        ggml/src/ggml-cuda.cu \
-        ggml/include/ggml.h \
-        ggml/include/ggml-backend.h \
-        ggml/include/ggml-cuda.h \
-        ggml/src/ggml-backend-impl.h \
-        ggml/src/ggml-common.h \
-        $(wildcard ggml/src/ggml-cuda/*.cuh)
-        $(NVCC_COMPILE)
-endif # GGML_CUDA
+        # NVCC compile rule
+        define NVCC_COMPILE
+            $(NVCC) $(MK_NVCCFLAGS) $(MK_CPPFLAGS) -Xcompiler "$(CUDA_CXXFLAGS)" -c $< -o $@
+        endef # NVCC_COMPILE
+
+        # CUDA object rules
+        ggml/src/ggml-cuda/%.o: \
+            ggml/src/ggml-cuda/%.cu \
+            ggml/include/ggml.h \
+            ggml/src/ggml-common.h \
+            ggml/src/ggml-cuda/common.cuh
+            $(NVCC_COMPILE)
+
+        ggml/src/ggml-cuda.o: \
+            ggml/src/ggml-cuda.cu \
+            ggml/include/ggml.h \
+            ggml/include/ggml-backend.h \
+            ggml/include/ggml-cuda.h \
+            ggml/src/ggml-backend-impl.h \
+            ggml/src/ggml-common.h \
+            $(wildcard ggml/src/ggml-cuda/*.cuh)
+            $(NVCC_COMPILE)
+    endif # GGML_CUDA
+endif # UNAME_S == Linux
+
 $(info )
 
 ifdef DEPRECATE_WARNING
