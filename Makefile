@@ -100,34 +100,34 @@ endif
 # of non-gcc compilers don't have to provide g++ alias or wrapper.
 # Detect operating system and set compilers accordingly
 ifeq ($(UNAME_S),Linux)
-    DEFCC  := gcc
-    DEFCXX := g++
+	DEFCC  := gcc
+	DEFCXX := g++
 
-    # Use g++-10 on Linux if available
-    GCC_VERSION := 10
-    GXX_PATH := /usr/bin/g++-$(GCC_VERSION)
-    ifneq ($(wildcard $(GXX_PATH)),)
-        DEFCXX := $(GXX_PATH)
-    else
-        $(warning g++-$(GCC_VERSION) not found. Using default g++)
-    endif
+	# Use g++-10 on Linux if available
+	GCC_VERSION := 10
+	GXX_PATH := /usr/bin/g++-$(GCC_VERSION)
+	ifneq ($(wildcard $(GXX_PATH)),)
+		DEFCXX := $(GXX_PATH)
+	else
+		$(warning g++-$(GCC_VERSION) not found. Using default g++)
+	endif
 else ifeq ($(UNAME_S),Darwin)
-    DEFCC  := cc
-    DEFCXX := c++
+	DEFCC  := cc
+	DEFCXX := c++
 endif
 
 # Override CC and CXX if not set
 ifeq ($(origin CC), default)
-    CC  := $(DEFCC)
+	CC  := $(DEFCC)
 endif
 ifeq ($(origin CXX), default)
-    CXX := $(DEFCXX)
+	CXX := $(DEFCXX)
 endif
 
 # Enable CUDA only on Linux
 ifeq ($(UNAME_S),Linux)
-    # Uncomment or set GGML_CUDA as needed
-    GGML_CUDA := 1
+	# Uncomment or set GGML_CUDA as needed
+	GGML_CUDA := 1
 endif
 
 # Mac OS + Arm can report x86_64
@@ -205,7 +205,7 @@ endif
 
 # keep standard at C11 and C++11
 MK_CPPFLAGS  = -Iggml/include -Iggml/src -Iinclude -Isrc -Iexamples
-MK_CFLAGS    = -std=c11   -fPIC
+MK_CFLAGS	= -std=c11   -fPIC
 MK_CXXFLAGS  = -std=c++14 -fPIC
 MK_NVCCFLAGS = -std=c++14 --expt-relaxed-constexpr -Xcompiler "-std=c++14"
 MK_NVCCFLAGS += --compiler-bindir=$(CXX)
@@ -215,7 +215,7 @@ CCACHE := $(shell which ccache)
 ifdef CCACHE
 export CCACHE_SLOPPINESS = time_macros
 $(info I ccache found, compilation results will be cached. Disable with WHISPER_NO_CCACHE.)
-CC    := $(CCACHE) $(CC)
+CC	:= $(CCACHE) $(CC)
 CXX   := $(CCACHE) $(CXX)
 else
 $(info I ccache not found. Consider installing it for faster compilation.)
@@ -269,7 +269,7 @@ ifdef GGML_SCHED_MAX_COPIES
 endif
 
 ifdef WHISPER_DEBUG
-	MK_CFLAGS    += -O0 -g
+	MK_CFLAGS	+= -O0 -g
 	MK_CXXFLAGS  += -O0 -g
 	MK_LDFLAGS   += -g
 	MK_NVCCFLAGS += -O0 -g
@@ -279,7 +279,7 @@ ifdef WHISPER_DEBUG
 	endif
 else
 	MK_CPPFLAGS   += -DNDEBUG
-	MK_CFLAGS     += -O3
+	MK_CFLAGS	 += -O3
 	MK_CXXFLAGS   += -O3
 	MK_NVCCFLAGS  += -O3
 endif
@@ -383,13 +383,13 @@ endif
 
 # Architecture specific
 # TODO: probably these flags need to be tweaked on some architectures
-#       feel free to update the Makefile for your architecture and send a pull request or issue
+#	   feel free to update the Makefile for your architecture and send a pull request or issue
 
 ifndef RISCV
 
 ifeq ($(UNAME_M),$(filter $(UNAME_M),x86_64 i686 amd64))
 	# Use all CPU extensions that are available:
-	MK_CFLAGS     += -march=native -mtune=native
+	MK_CFLAGS	 += -march=native -mtune=native
 	HOST_CXXFLAGS += -march=native -mtune=native
 
 	# Usage AVX-only
@@ -478,7 +478,7 @@ ifndef GGML_NO_ACCELERATE
 		MK_CPPFLAGS += -DACCELERATE_NEW_LAPACK
 		MK_CPPFLAGS += -DACCELERATE_LAPACK_ILP64
 		MK_LDFLAGS  += -framework Accelerate
-		OBJ_GGML    += ggml/src/ggml-blas.o
+		OBJ_GGML	+= ggml/src/ggml-blas.o
 	endif
 endif # GGML_NO_ACCELERATE
 
@@ -492,29 +492,29 @@ ifdef GGML_OPENBLAS
 	MK_CPPFLAGS += -DGGML_USE_BLAS $(shell pkg-config --cflags-only-I openblas)
 	MK_CFLAGS   += $(shell pkg-config --cflags-only-other openblas)
 	MK_LDFLAGS  += $(shell pkg-config --libs openblas)
-	OBJ_GGML    += ggml/src/ggml-blas.o
+	OBJ_GGML	+= ggml/src/ggml-blas.o
 endif # GGML_OPENBLAS
 
 ifdef GGML_OPENBLAS64
 	MK_CPPFLAGS += -DGGML_USE_BLAS $(shell pkg-config --cflags-only-I openblas64)
 	MK_CFLAGS   += $(shell pkg-config --cflags-only-other openblas64)
 	MK_LDFLAGS  += $(shell pkg-config --libs openblas64)
-	OBJ_GGML    += ggml/src/ggml-blas.o
+	OBJ_GGML	+= ggml/src/ggml-blas.o
 endif # GGML_OPENBLAS64
 
 ifdef GGML_BLIS
 	MK_CPPFLAGS += -DGGML_USE_BLAS -I/usr/local/include/blis -I/usr/include/blis
 	MK_LDFLAGS  += -lblis -L/usr/local/lib
-	OBJ_GGML    += ggml/src/ggml-blas.o
+	OBJ_GGML	+= ggml/src/ggml-blas.o
 endif # GGML_BLIS
 
 ifdef GGML_RPC
 	MK_CPPFLAGS += -DGGML_USE_RPC
-	OBJ_GGML    += ggml/src/ggml-rpc.o
+	OBJ_GGML	+= ggml/src/ggml-rpc.o
 endif # GGML_RPC
 
-OBJ_CUDA_TMPL      = $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/template-instances/fattn-wmma*.cu))
-OBJ_CUDA_TMPL     += $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/template-instances/mmq*.cu))
+OBJ_CUDA_TMPL	  = $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/template-instances/fattn-wmma*.cu))
+OBJ_CUDA_TMPL	 += $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/template-instances/mmq*.cu))
 
 ifdef GGML_CUDA_FA_ALL_QUANTS
 	OBJ_CUDA_TMPL += $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/template-instances/fattn-vec*.cu))
@@ -653,7 +653,7 @@ endif # GGML_CUDA
 ifdef GGML_VULKAN
 	MK_CPPFLAGS += -DGGML_USE_VULKAN
 	MK_LDFLAGS  += $(shell pkg-config --libs vulkan)
-	OBJ_GGML    += ggml/src/ggml-vulkan.o ggml/src/ggml-vulkan-shaders.o
+	OBJ_GGML	+= ggml/src/ggml-vulkan.o ggml/src/ggml-vulkan-shaders.o
 
 ifdef GGML_VULKAN_CHECK_RESULTS
 	MK_CPPFLAGS  += -DGGML_VULKAN_CHECK_RESULTS
@@ -693,7 +693,7 @@ $(_ggml_vk_header): $(_ggml_vk_source)
 
 $(_ggml_vk_source): $(_ggml_vk_shader_deps) vulkan-shaders-gen
 	$(_ggml_vk_genshaders_cmd) \
-		--glslc      $(GLSLC_CMD) \
+		--glslc	  $(GLSLC_CMD) \
 		--input-dir  $(_ggml_vk_input_dir) \
 		--target-hpp $(_ggml_vk_header) \
 		--target-cpp $(_ggml_vk_source)
@@ -705,15 +705,15 @@ endif # GGML_VULKAN
 
 ifdef GGML_HIPBLAS
 	ifeq ($(wildcard /opt/rocm),)
-		ROCM_PATH      ?= /usr
+		ROCM_PATH	  ?= /usr
 		AMDGPU_TARGETS ?= $(shell $(shell which amdgpu-arch))
 	else
 		ROCM_PATH	?= /opt/rocm
 		AMDGPU_TARGETS ?= $(shell $(ROCM_PATH)/llvm/bin/amdgpu-arch)
 	endif
 
-	GGML_CUDA_DMMV_X       ?= 32
-	GGML_CUDA_MMV_Y        ?= 1
+	GGML_CUDA_DMMV_X	   ?= 32
+	GGML_CUDA_MMV_Y		?= 1
 	GGML_CUDA_KQUANTS_ITER ?= 2
 
 	MK_CPPFLAGS += -DGGML_USE_HIPBLAS -DGGML_USE_CUDA
@@ -773,13 +773,13 @@ endif
 
 ifdef GGML_METAL_EMBED_LIBRARY
 	MK_CPPFLAGS += -DGGML_METAL_EMBED_LIBRARY
-	OBJ_GGML    += ggml/src/ggml-metal-embed.o
+	OBJ_GGML	+= ggml/src/ggml-metal-embed.o
 endif
 endif # GGML_METAL
 
 ifdef WHISPER_COREML
 	MK_CXXFLAGS += -DWHISPER_USE_COREML
-	LDFLAGS     += -framework Foundation -framework CoreML
+	LDFLAGS	 += -framework Foundation -framework CoreML
 
 ifdef WHISPER_COREML_ALLOW_FALLBACK
 	MK_CXXFLAGS += -DWHISPER_COREML_ALLOW_FALLBACK
@@ -802,12 +802,12 @@ ggml/src/ggml-metal-embed.o: \
 	@echo "Embedding Metal library"
 	@sed -e '/#include "ggml-common.h"/r ggml/src/ggml-common.h' -e '/#include "ggml-common.h"/d' < ggml/src/ggml-metal.metal > ggml/src/ggml-metal-embed.metal
 	$(eval TEMP_ASSEMBLY=$(shell mktemp))
-	@echo ".section __DATA, __ggml_metallib"            >  $(TEMP_ASSEMBLY)
-	@echo ".globl _ggml_metallib_start"                 >> $(TEMP_ASSEMBLY)
-	@echo "_ggml_metallib_start:"                       >> $(TEMP_ASSEMBLY)
+	@echo ".section __DATA, __ggml_metallib"			>  $(TEMP_ASSEMBLY)
+	@echo ".globl _ggml_metallib_start"				 >> $(TEMP_ASSEMBLY)
+	@echo "_ggml_metallib_start:"					   >> $(TEMP_ASSEMBLY)
 	@echo ".incbin \"ggml/src/ggml-metal-embed.metal\"" >> $(TEMP_ASSEMBLY)
-	@echo ".globl _ggml_metallib_end"                   >> $(TEMP_ASSEMBLY)
-	@echo "_ggml_metallib_end:"                         >> $(TEMP_ASSEMBLY)
+	@echo ".globl _ggml_metallib_end"				   >> $(TEMP_ASSEMBLY)
+	@echo "_ggml_metallib_end:"						 >> $(TEMP_ASSEMBLY)
 	@$(AS) $(TEMP_ASSEMBLY) -o $@
 	@rm -f ${TEMP_ASSEMBLY}
 endif
@@ -863,8 +863,8 @@ include scripts/get-flags.mk
 
 # combine build flags with cmdline overrides
 override CPPFLAGS  := $(MK_CPPFLAGS) $(CPPFLAGS)
-override CFLAGS    := $(CPPFLAGS) $(MK_CFLAGS) $(GF_CFLAGS) $(CFLAGS)
-BASE_CXXFLAGS      := $(MK_CXXFLAGS) $(CXXFLAGS)
+override CFLAGS	:= $(CPPFLAGS) $(MK_CFLAGS) $(GF_CFLAGS) $(CFLAGS)
+BASE_CXXFLAGS	  := $(MK_CXXFLAGS) $(CXXFLAGS)
 override CXXFLAGS  := $(BASE_CXXFLAGS) $(HOST_CXXFLAGS) $(GF_CXXFLAGS) $(CPPFLAGS)
 override NVCCFLAGS := $(MK_NVCCFLAGS) $(NVCCFLAGS)
 override LDFLAGS   := $(MK_LDFLAGS) $(LDFLAGS)
@@ -889,12 +889,12 @@ $(info I whisper.cpp build info: )
 $(info I UNAME_S:   $(UNAME_S))
 $(info I UNAME_P:   $(UNAME_P))
 $(info I UNAME_M:   $(UNAME_M))
-$(info I CFLAGS:    $(CFLAGS))
+$(info I CFLAGS:	$(CFLAGS))
 $(info I CXXFLAGS:  $(CXXFLAGS))
 $(info I NVCCFLAGS: $(NVCCFLAGS))
 $(info I LDFLAGS:   $(LDFLAGS))
-$(info I CC:        $(shell $(CC)   --version | head -n 1))
-$(info I CXX:       $(shell $(CXX)  --version | head -n 1))
+$(info I CC:		$(shell $(CC)   --version | head -n 1))
+$(info I CXX:	   $(shell $(CXX)  --version | head -n 1))
 ifdef GGML_CUDA
 	ifeq ($(UNAME_S),Linux)
 		# CUDA path setup
@@ -1033,14 +1033,14 @@ ggml/src/ggml-quants.o: \
 	ggml/include/ggml.h \
 	ggml/src/ggml-quants.h \
 	ggml/src/ggml-common.h
-	$(CC) $(CFLAGS)    -c $< -o $@
+	$(CC) $(CFLAGS)	-c $< -o $@
 
 ggml/src/ggml-aarch64.o: \
 	ggml/src/ggml-aarch64.c \
 	ggml/include/ggml.h \
 	ggml/src/ggml-aarch64.h \
 	ggml/src/ggml-common.h
-	$(CC) $(CFLAGS)    -c $< -o $@
+	$(CC) $(CFLAGS)	-c $< -o $@
 
 ggml/src/ggml-blas.o: \
 	ggml/src/ggml-blas.cpp \
@@ -1198,7 +1198,7 @@ lsp: examples/lsp/lsp.cpp \
 	$(CXX) $(CXXFLAGS) $(filter-out %.h $<,$^) $(call GET_OBJ_FILE, $<) -o $@ $(LDFLAGS) $(LDFLAGS_SDL)
 
 # TODO: disabled until update
-#       https://github.com/ggerganov/whisper.cpp/issues/1818
+#	   https://github.com/ggerganov/whisper.cpp/issues/1818
 #talk: examples/talk/talk.cpp examples/talk/gpt-2.cpp \
 #	$(OBJ_GGML) $(OBJ_WHISPER) $(OBJ_COMMON) $(OBJ_SDL)
 #	$(CXX) $(CXXFLAGS) $(CFLAGS_SDL) -c $< -o $(call GET_OBJ_FILE, $<)
@@ -1275,7 +1275,7 @@ tiny.en tiny base.en base small.en small medium.en medium large-v1 large-v2 larg
 	@for f in samples/*.wav; do \
 		echo "----------------------------------------------" ; \
 		echo "[+] Running $@ on $$f ... (run 'ffplay $$f' to listen)" ; \
-	    echo "----------------------------------------------" ; \
+		echo "----------------------------------------------" ; \
 		echo "" ; \
 		./main -m models/ggml-$@.bin -f $$f ; \
 		echo "" ; \
