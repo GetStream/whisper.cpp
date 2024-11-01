@@ -896,92 +896,92 @@ $(info I LDFLAGS:   $(LDFLAGS))
 $(info I CC:        $(shell $(CC)   --version | head -n 1))
 $(info I CXX:       $(shell $(CXX)  --version | head -n 1))
 ifdef GGML_CUDA
-    ifeq ($(UNAME_S),Linux)
-        # CUDA path setup
-        ifneq ('', '$(wildcard /opt/cuda)')
-            CUDA_PATH ?= /opt/cuda
-        else
-            CUDA_PATH ?= /usr/local/cuda
-        endif
+	ifeq ($(UNAME_S),Linux)
+		# CUDA path setup
+		ifneq ('', '$(wildcard /opt/cuda)')
+			CUDA_PATH ?= /opt/cuda
+		else
+			CUDA_PATH ?= /usr/local/cuda
+		endif
 
-        # Include paths
-        MK_CPPFLAGS += -DGGML_USE_CUDA -I$(CUDA_PATH)/include -I$(CUDA_PATH)/targets/$(UNAME_M)-linux/include
-        MK_CPPFLAGS += -I/usr/local/cuda/include -I/usr/local/cuda/targets/x86_64-linux/include
+		# Include paths
+		MK_CPPFLAGS += -DGGML_USE_CUDA -I$(CUDA_PATH)/include -I$(CUDA_PATH)/targets/$(UNAME_M)-linux/include
+		MK_CPPFLAGS += -I/usr/local/cuda/include -I/usr/local/cuda/targets/x86_64-linux/include
 
-        # Linker flags
-        MK_LDFLAGS += -lcuda -lcublas -lculibos -lcudart -lcufft -lcublasLt -lpthread -ldl -lrt -L$(CUDA_PATH)/lib64 -L/usr/lib64 -L$(CUDA_PATH)/targets/$(UNAME_M)-linux/lib -L$(CUDA_PATH)/lib64/stubs -L/usr/lib/wsl/lib
+		# Linker flags
+		MK_LDFLAGS += -lcuda -lcublas -lculibos -lcudart -lcufft -lcublasLt -lpthread -ldl -lrt -L$(CUDA_PATH)/lib64 -L/usr/lib64 -L$(CUDA_PATH)/targets/$(UNAME_M)-linux/lib -L$(CUDA_PATH)/lib64/stubs -L/usr/lib/wsl/lib
 
-        # NVCC flags
-        MK_NVCCFLAGS += -std=c++14 --expt-relaxed-constexpr -Xcompiler "-std=c++14" --compiler-bindir=$(CXX) -O3 -use_fast_math --forward-unknown-to-host-compiler -Wno-deprecated-gpu-targets -arch=compute_75 \
-                       -DGGML_CUDA_DMMV_X=32 -DGGML_CUDA_MMV_Y=1 -DK_QUANTS_PER_ITERATION=2 -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128
+		# NVCC flags
+		MK_NVCCFLAGS += -std=c++14 --expt-relaxed-constexpr -Xcompiler "-std=c++14" --compiler-bindir=$(CXX) -O3 -use_fast_math --forward-unknown-to-host-compiler -Wno-deprecated-gpu-targets -arch=compute_75 \
+					   -DGGML_CUDA_DMMV_X=32 -DGGML_CUDA_MMV_Y=1 -DK_QUANTS_PER_ITERATION=2 -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128
 
-        # Additional compiler flags
-        CUDA_CXXFLAGS += -std=c++14 -fPIC -O3 -Wall -Wextra -Wpedantic \
-                          -Wcast-qual -Wno-unused-function -Wmissing-declarations \
-                          -Wmissing-noreturn -pthread -fopenmp -Wno-array-bounds \
-                          -Wno-format-truncation -Wextra-semi -Wno-pedantic
+		# Additional compiler flags
+		CUDA_CXXFLAGS += -std=c++14 -fPIC -O3 -Wall -Wextra -Wpedantic \
+						  -Wcast-qual -Wno-unused-function -Wmissing-declarations \
+						  -Wmissing-noreturn -pthread -fopenmp -Wno-array-bounds \
+						  -Wno-format-truncation -Wextra-semi -Wno-pedantic
 
-        # Object files
-        OBJ_GGML += ggml/src/ggml-cuda.o
-        OBJ_GGML += $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/*.cu))
-        OBJ_GGML += $(OBJ_CUDA_TMPL)
+		# Object files
+		OBJ_GGML += ggml/src/ggml-cuda.o
+		OBJ_GGML += $(patsubst %.cu,%.o,$(wildcard ggml/src/ggml-cuda/*.cu))
+		OBJ_GGML += $(OBJ_CUDA_TMPL)
 
-        # Fatal warnings
-        ifdef WHISPER_FATAL_WARNINGS
-            MK_NVCCFLAGS += -Werror all-warnings
-        endif # WHISPER_FATAL_WARNINGS
+		# Fatal warnings
+		ifdef WHISPER_FATAL_WARNINGS
+			MK_NVCCFLAGS += -Werror all-warnings
+		endif # WHISPER_FATAL_WARNINGS
 
-        # Forward unknown to host compiler
-        ifndef JETSON_EOL_MODULE_DETECT
-            MK_NVCCFLAGS += --forward-unknown-to-host-compiler
-        endif # JETSON_EOL_MODULE_DETECT
+		# Forward unknown to host compiler
+		ifndef JETSON_EOL_MODULE_DETECT
+			MK_NVCCFLAGS += --forward-unknown-to-host-compiler
+		endif # JETSON_EOL_MODULE_DETECT
 
-        # Debug flags
-        ifdef WHISPER_DEBUG
-            MK_NVCCFLAGS += -lineinfo
-        endif # WHISPER_DEBUG
+		# Debug flags
+		ifdef WHISPER_DEBUG
+			MK_NVCCFLAGS += -lineinfo
+		endif # WHISPER_DEBUG
 
-        ifdef GGML_CUDA_DEBUG
-            MK_NVCCFLAGS += --device-debug
-        endif # GGML_CUDA_DEBUG
+		ifdef GGML_CUDA_DEBUG
+			MK_NVCCFLAGS += --device-debug
+		endif # GGML_CUDA_DEBUG
 
-        # NVCC definition
-        ifdef GGML_CUDA_NVCC
-            NVCC = $(CCACHE) $(GGML_CUDA_NVCC)
-        else
-            NVCC = $(CCACHE) nvcc
-        endif #GGML_CUDA_NVCC
+		# NVCC definition
+		ifdef GGML_CUDA_NVCC
+			NVCC = $(CCACHE) $(GGML_CUDA_NVCC)
+		else
+			NVCC = $(CCACHE) nvcc
+		endif #GGML_CUDA_NVCC
 
-        # Architecture-specific NVCC flags
-        ifdef CUDA_DOCKER_ARCH
-            MK_NVCCFLAGS += -Wno-deprecated-gpu-targets -arch=$(CUDA_DOCKER_ARCH)
-        else ifndef CUDA_POWER_ARCH
-            MK_NVCCFLAGS += -arch=compute_75
-        endif # CUDA_DOCKER_ARCH
+		# Architecture-specific NVCC flags
+		ifdef CUDA_DOCKER_ARCH
+			MK_NVCCFLAGS += -Wno-deprecated-gpu-targets -arch=$(CUDA_DOCKER_ARCH)
+		else ifndef CUDA_POWER_ARCH
+			MK_NVCCFLAGS += -arch=compute_75
+		endif # CUDA_DOCKER_ARCH
 
-        # NVCC compile rule
-        define NVCC_COMPILE
-            $(NVCC) $(MK_NVCCFLAGS) $(MK_CPPFLAGS) -Xcompiler "$(CUDA_CXXFLAGS)" -c $< -o $@
-        endef # NVCC_COMPILE
+		# NVCC compile rule
+		define NVCC_COMPILE
+			$(NVCC) $(MK_NVCCFLAGS) $(MK_CPPFLAGS) -Xcompiler "$(CUDA_CXXFLAGS)" -c $< -o $@
+		endef # NVCC_COMPILE
 
-        # CUDA object rules
-        ggml/src/ggml-cuda/%.o: \
-            ggml/src/ggml-cuda/%.cu \
-            ggml/include/ggml.h \
-            ggml/src/ggml-common.h \
-            ggml/src/ggml-cuda/common.cuh
-        	$(NVCC_COMPILE)
+		# CUDA object rules
+		ggml/src/ggml-cuda/%.o: \
+			ggml/src/ggml-cuda/%.cu \
+			ggml/include/ggml.h \
+			ggml/src/ggml-common.h \
+			ggml/src/ggml-cuda/common.cuh
+			$(NVCC_COMPILE)
 
-        ggml/src/ggml-cuda.o: \
-            ggml/src/ggml-cuda.cu \
-            ggml/include/ggml.h \
-            ggml/include/ggml-backend.h \
-            ggml/include/ggml-cuda.h \
-            ggml/src/ggml-backend-impl.h \
-            ggml/src/ggml-common.h \
-            $(wildcard ggml/src/ggml-cuda/*.cuh)
-            $(NVCC_COMPILE)
-    endif # GGML_CUDA
+		ggml/src/ggml-cuda.o: \
+			ggml/src/ggml-cuda.cu \
+			ggml/include/ggml.h \
+			ggml/include/ggml-backend.h \
+			ggml/include/ggml-cuda.h \
+			ggml/src/ggml-backend-impl.h \
+			ggml/src/ggml-common.h \
+			$(wildcard ggml/src/ggml-cuda/*.cuh)
+			$(NVCC_COMPILE)
+	endif # GGML_CUDA
 endif # UNAME_S == Linux
 
 $(info )
