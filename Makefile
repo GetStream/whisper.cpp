@@ -98,8 +98,8 @@ endif
 
 # In GNU make default CXX is g++ instead of c++.  Let's fix that so that users
 # of non-gcc compilers don't have to provide g++ alias or wrapper.
-DEFCC  := cc
-DEFCXX := c++
+DEFCC  := gcc
+DEFCXX := g++
 ifeq ($(origin CC),default)
 CC  := $(DEFCC)
 endif
@@ -184,7 +184,8 @@ endif
 MK_CPPFLAGS  = -Iggml/include -Iggml/src -Iinclude -Isrc -Iexamples
 MK_CFLAGS    = -std=c11   -fPIC
 MK_CXXFLAGS  = -std=c++14 -fPIC
-MK_NVCCFLAGS = -std=c++14
+MK_NVCCFLAGS = -std=c++14 --expt-relaxed-constexpr -Xcompiler "-std=c++14"
+MK_NVCCFLAGS += --compiler-bindir=$(CXX)
 
 ifndef WHISPER_NO_CCACHE
 CCACHE := $(shell which ccache)
