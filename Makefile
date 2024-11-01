@@ -970,7 +970,7 @@ ifdef GGML_CUDA
             ggml/include/ggml.h \
             ggml/src/ggml-common.h \
             ggml/src/ggml-cuda/common.cuh
-            $(NVCC_COMPILE)
+        	$(NVCC_COMPILE)
 
         ggml/src/ggml-cuda.o: \
             ggml/src/ggml-cuda.cu \
