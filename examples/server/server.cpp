@@ -131,7 +131,7 @@ namespace whisper_server {
     return std::max(1, static_cast < int > (available_memory / MODEL_MEMORY_USAGE));
     #elif defined(__APPLE__)
     // Fixed number for Apple devices
-    return 4;
+    return 8;
     #else
     return std::max(1, static_cast < int > (std::thread::hardware_concurrency() / 2));
     #endif
@@ -606,7 +606,109 @@ int main(int argc, char ** argv) {
   // Set maximum request size (Use set_payload_max_length)
   svr.set_payload_max_length(MAX_UPLOAD_SIZE);
 
-  // [Your existing POST /inference handler and other handlers...]
+  // POST /inference handler
+svr.Post(sparams.request_path + sparams.inference_path,
+      [ & ](const httplib::Request & req, httplib::Response & res) {
+        try {
+          auto task = std::make_shared < server_task > ();
+          task -> id = task_counter++; // Assign unique task ID
+          task -> params = params;
+
+          if (!req.has_file("file")) {
+            res.status = 400; // Bad Request
+            res.set_content("{\"error\":\"Missing 'file' in request\"}",
+              "application/json");
+            return;
+          }
+
+          auto audio_file = req.get_file_value("file");
+          if (audio_file.content.size() > MAX_UPLOAD_SIZE) {
+            res.status = 413; // Payload Too Large
+            res.set_content("{\"error\":\"File too large\"}",
+              "application/json");
+            return;
+          }
+
+          if (!::read_wav(audio_file.content, task -> pcmf32, task -> pcmf32s,
+              params.diarize)) {
+            res.status = 400; // Bad Request
+            res.set_content("{\"error\":\"Failed to read audio\"}",
+              "application/json");
+            return;
+          }
+
+          // Enqueue the task in the thread pool
+          auto future_result = thread_pool.enqueue([task, & pool]() {
+            auto instance = pool -> get_instance();
+            if (instance) {
+              try {
+                // Logging: Instance acquired
+                std::cout << "[" << current_timestamp() << "] [Thread " << std::this_thread::get_id() <<
+                  "] Instance " << instance -> id << " acquired\n";
+                // Logging: Processing task
+                std::cout << "[" << current_timestamp() << "] [Thread " << std::this_thread::get_id() <<
+                  "] Processing task " << task -> id << " using instance " << instance -> id << "\n";
+
+                // Start time
+                auto start = std::chrono::steady_clock::now();
+
+                std::string result = process_audio(
+                  instance -> ctx -> get(), task -> params, task -> pcmf32, task -> pcmf32s);
+
+                // End time
+                auto end = std::chrono::steady_clock::now();
+                auto duration_ms = std::chrono::duration_cast < std::chrono::milliseconds > (end - start).count();
+
+                // Logging: Task completed
+                std::cout << "[" << current_timestamp() << "] [Thread " << std::this_thread::get_id() <<
+                  "] Task " << task -> id << " completed in " << duration_ms << " ms\n";
+
+                task -> result_promise.set_value(result);
+              } catch (const std::exception & e) {
+                // Exception handling
+                task -> result_promise.set_value(
+                  std::string("{\"error\":\"") + e.what() + "\"}");
+              }
+              pool -> release_instance(instance);
+              // Logging: Instance released
+              std::cout << "[" << current_timestamp() << "] [Thread " << std::this_thread::get_id() <<
+                "] Instance " << instance -> id << " released\n";
+            } else {
+              // No available instances
+              task -> result_promise.set_value(
+                "{\"error\":\"no available instances\"}");
+            }
+          });
+
+          // Wait for the task to complete
+          future_result.wait();
+
+          // Get the result from the task
+          res.set_content(task -> result_promise.get_future().get(), "application/json");
+        } catch (const std::exception & e) {
+          res.status = 500; // Internal Server Error
+          res.set_content("{\"error\":\"Internal server error\"}",
+            "application/json");
+        }
+      });
+
+    // Exception handler
+    svr.set_exception_handler([](const httplib::Request & , httplib::Response & res,
+      std::exception_ptr ep) {
+      try {
+        std::rethrow_exception(ep);
+      } catch (const std::exception & e) {
+        res.status = 500; // Internal Server Error
+        res.set_content(std::string("{\"error\":\"") + e.what() + "\"}",
+          "application/json");
+      }
+    });
+
+    // Error handler
+    svr.set_error_handler([](const httplib::Request & /*req*/ , httplib::Response & res) {
+      res.status = 404; // Not Found
+      res.set_content("{\"error\":\"Invalid request\"}", "application/json");
+    });
 
   svr.set_read_timeout(sparams.read_timeout);
   svr.set_write_timeout(sparams.write_timeout);

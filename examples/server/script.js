@@ -10,10 +10,10 @@ export const options = {
       executor: "ramping-arrival-rate",
       startRate: 1,
       timeUnit: "1s",
-      preAllocatedVUs: 4, // Pre-allocate 4 VUs
-      maxVUs: 4,
+      preAllocatedVUs: 8, // Pre-allocate 4 VUs
+      maxVUs: 8,
       stages: [
-        { target: 4, duration: "10s" }, // Start with 4 requests per second for warm-up
+        { target: 8, duration: "10s" }, // Start with 4 requests per second for warm-up
         { target: 1, duration: "50s" }, // Sustain 1 request per second for 50s with 4 VUs
       ],
     },
