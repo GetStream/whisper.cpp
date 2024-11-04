@@ -281,41 +281,6 @@ namespace whisper_server {
     std::promise < std::string > result_promise;
   };
 
-  class server_queue {
-    public: void post(std::shared_ptr < server_task > task) {
-      std::lock_guard < std::mutex > lock(mutex);
-      tasks.push(task);
-      condition.notify_one();
-    }
-
-    std::shared_ptr < server_task > receive() {
-      std::unique_lock < std::mutex > lock(mutex);
-      while (tasks.empty() && !exit_flag.load()) {
-        condition.wait(lock);
-      }
-      if (!tasks.empty()) {
-        auto task = tasks.front();
-        tasks.pop();
-        return task;
-      } else {
-        return nullptr;
-      }
-    }
-
-    bool empty() {
-      std::lock_guard < std::mutex > lock(mutex);
-      return tasks.empty();
-    }
-
-    void shutdown() {
-      exit_flag.store(true);
-      condition.notify_all();
-    }
-
-    private: std::queue < std::shared_ptr < server_task >> tasks;
-    std::mutex mutex;
-    std::condition_variable condition;
-  };
 
   // Function to print usage/help information
   static void whisper_print_usage(int /*argc*/ , char ** argv,
@@ -594,8 +559,6 @@ int main(int argc, char ** argv) {
     { "Access-Control-Allow-Origin", "*" },
     { "Access-Control-Allow-Headers", "content-type, authorization" },
   });
-
-  server_queue task_queue;
 
   // Atomic counter for task IDs
   std::atomic<int> task_counter{0};
