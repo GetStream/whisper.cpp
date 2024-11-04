@@ -128,8 +128,10 @@ namespace whisper_server {
     size_t available_memory = 0;
     size_t total_memory = 0;
     cudaMemGetInfo( & available_memory, & total_memory);
+    // remove 1164MiB to account for the memory used by the system
+    // available_memory -= 1164 * 1024 * 1024;
     int calculated_instances = static_cast<int>(available_memory / MODEL_MEMORY_USAGE);
-    return std::max(1, std::min(17, calculated_instances));
+    return std::max(1, std::min(15, calculated_instances));
     #elif defined(__APPLE__)
     // Fixed number for Apple devices
     return 8;
