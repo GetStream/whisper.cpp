@@ -599,9 +599,10 @@ int main(int argc, char ** argv) {
 
   // Atomic counter for task IDs
   std::atomic<int> task_counter{0};
-
+  // and multiply by 2 to account for the two threads per instance
+  int num_threads = num_instances;
   // Create a thread pool with a suitable number of threads
-  ThreadPool thread_pool(std::thread::hardware_concurrency());
+  ThreadPool thread_pool(num_threads);
 
   // Set maximum request size (Use set_payload_max_length)
   svr.set_payload_max_length(MAX_UPLOAD_SIZE);
@@ -723,6 +724,8 @@ svr.Post(sparams.request_path + sparams.inference_path,
   // Restrict served files
   svr.set_mount_point("/", sparams.public_path.c_str());
 
+//print threds
+std::cout << "Number of threads: " << num_threads << std::endl;
   std::cout << "[" << current_timestamp() << "] Whisper server listening at http://" <<
     sparams.hostname << ":" << sparams.port << " with " << num_instances <<
     " model instances ("
