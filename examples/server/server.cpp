@@ -713,138 +713,125 @@ int main(int argc, char ** argv) {
   // POST /inference handler
   svr.Post(sparams.request_path + sparams.inference_path,
       [&](const httplib::Request& req_, httplib::Response& res_) {
-          auto total_start = std::chrono::steady_clock::now();
+          const auto request_start = std::chrono::steady_clock::now();
 
-          std::cout << "[" << current_timestamp() << "] POST " << sparams.inference_path << "\n";
+          // Log initial state before processing
+          if (params.debug_mode) {
+              std::cout << "[" << current_timestamp() << "] POST " << sparams.inference_path << "\n"
+                        << thread_pool.get_stats() << "\n";
+          }
 
-          try {
-              // 1. Request validation and parsing
-              auto parse_start = std::chrono::steady_clock::now();
+          // Parse request and prepare data before queuing
+          if (!req_.has_file("file")) {
+              res_.status = 400;
+              res_.set_content(R"({"error":"Missing 'file' in request"})", "application/json");
+              return;
+          }
 
-              if (!req_.has_file("file")) {
-                  res_.status = 400;
-                  res_.set_content(R"({"error":"Missing 'file' in request"})", "application/json");
-                  return;
+          const auto audio_file = req_.get_file_value("file");
+          if (audio_file.content.size() > MAX_UPLOAD_SIZE) {
+              res_.status = 413;
+              res_.set_content(R"({"error":"File too large"})", "application/json");
+              return;
+          }
+
+          // Parse WAV data
+          std::vector<float> pcmf32;
+          std::vector<std::vector<float>> pcmf32s;
+          if (!::read_wav(audio_file.content, pcmf32, pcmf32s, params.diarize)) {
+              res_.status = 400;
+              res_.set_content(R"({"error":"Failed to read audio"})", "application/json");
+              return;
+          }
+
+          // Create promise/future for the result
+          std::promise<json> result_promise;
+          auto result_future = result_promise.get_future();
+
+          // Now enqueue the actual processing work
+          const auto queue_start = std::chrono::steady_clock::now();
+
+          thread_pool.enqueue([queue_start,
+                             request_start,
+                             pcmf32 = std::move(pcmf32),
+                             pcmf32s = std::move(pcmf32s),
+                             &pool,
+                             &params,
+                             result_promise = std::move(result_promise)]() mutable {
+              try {
+                  // Try to acquire a whisper instance
+                  auto instance = pool->get_instance();
+                  if (!instance) {
+                      json error_response = {
+                          {"error", "No available instances"},
+                          {"status", 503}
+                      };
+                      result_promise.set_value(error_response);
+                      return;
+                  }
+
+                  const auto processing_start = std::chrono::steady_clock::now();
+                  auto queue_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      processing_start - queue_start).count();
+
+                  // Process audio
+                  auto process_result = process_audio(instance->ctx->get(), params, pcmf32, pcmf32s);
+
+                  // Release the instance
+                  pool->release_instance(instance);
+
+                  const auto processing_end = std::chrono::steady_clock::now();
+                  auto processing_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      processing_end - processing_start).count();
+
+                  // Prepare response with timing information
+                  json response;
+                  if (params.response_format == "json") {
+                      response = json::parse(process_result);
+                  } else {
+                      response["text"] = process_result;
+                  }
+
+                  response["queue_time_ms"] = queue_time;
+                  response["processing_time_ms"] = processing_time;
+                  response["total_time_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      processing_end - request_start).count();
+                  response["status"] = 200;
+
+                  result_promise.set_value(response);
+
+              } catch (const std::exception& e) {
+                  result_promise.set_value({
+                      {"error", "Internal server error"},
+                      {"status", 500}
+                  });
               }
+          });
 
-              auto audio_file = req_.get_file_value("file");
-              if (audio_file.content.size() > MAX_UPLOAD_SIZE) {
-                  res_.status = 413;
-                  res_.set_content(R"({"error":"File too large"})", "application/json");
-                  return;
-              }
+          // Wait for the result with timeout
+          if (result_future.wait_for(std::chrono::milliseconds(PROCESSING_TIMEOUT_MS))
+              == std::future_status::timeout) {
+              res_.status = 504;
+              res_.set_content(R"({"error":"Processing timeout"})", "application/json");
+              return;
+          }
 
-              auto parse_end = std::chrono::steady_clock::now();
-              auto parse_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  parse_end - parse_start).count();
+          // Get the result and send response
+          json result = result_future.get();
+          int status = result["status"].get<int>();
+          result.erase("status");
 
-              if (params.debug_mode) {
-                  std::cout << "[" << current_timestamp() << "] Request parsing completed in "
-                            << parse_duration << "ms, file size: "
-                            << (audio_file.content.size() / 1024) << "KB\n";
-              }
+          res_.status = status;
+          res_.set_content(result.dump(), "application/json");
 
-              // 2. WAV parsing
-              auto wav_start = std::chrono::steady_clock::now();
-              std::vector<float> pcmf32;
-              std::vector<std::vector<float>> pcmf32s;
+          // Final stats after processing
+          if (params.debug_mode) {
+              const auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - request_start).count();
 
-              if (!::read_wav(audio_file.content, pcmf32, pcmf32s, params.diarize)) {
-                  res_.status = 400;
-                  res_.set_content(R"({"error":"Failed to read audio"})", "application/json");
-                  return;
-              }
-
-              auto wav_end = std::chrono::steady_clock::now();
-              auto wav_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  wav_end - wav_start).count();
-
-              if (params.debug_mode) {
-                  std::cout << "[" << current_timestamp() << "] WAV parsing completed in "
-                            << wav_duration << "ms\n";
-              }
-
-              // 3. Instance acquisition
-              auto acquire_start = std::chrono::steady_clock::now();
-              auto instance = pool->get_instance();
-              auto acquire_end = std::chrono::steady_clock::now();
-
-              if (!instance) {
-                  res_.status = 503;
-                  res_.set_content(R"({"error":"No available instances"})", "application/json");
-                  return;
-              }
-
-              auto acquire_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  acquire_end - acquire_start).count();
-
-              if (params.debug_mode) {
-                  std::cout << "[" << current_timestamp() << "] Instance " << instance->id
-                            << " acquired by thread " << std::this_thread::get_id()
-                            << " after waiting " << acquire_duration << "ms\n";
-              }
-
-              // 4. Audio processing
-              auto process_start = std::chrono::steady_clock::now();
-              auto result = process_audio(instance->ctx->get(), params, pcmf32, pcmf32s);
-              auto process_end = std::chrono::steady_clock::now();
-
-              auto process_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-              process_end - process_start).count();
-
-              if (process_duration > PROCESSING_TIMEOUT_MS) {
-                if (params.debug_mode) {
-                        std::cout << "[" << current_timestamp() << "] Processing timeout after "
-                        << process_duration << "ms\n";
-                }
-                pool->release_instance(instance);
-                res_.status = 504;  // Gateway Timeout
-                res_.set_content(R"({"error":"Processing timeout"})", "application/json");
-                return;
-              }
-
-              // 5. Instance release
-              auto release_start = std::chrono::steady_clock::now();
-              pool->release_instance(instance);
-              auto release_end = std::chrono::steady_clock::now();
-
-              if (params.debug_mode) {
-                  std::cout << "[" << current_timestamp() << "] Instance " << instance->id
-                            << " released by thread " << std::this_thread::get_id()
-                            << ", release took "
-                            << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                release_end - release_start).count() << "ms\n";
-              }
-
-              // 6. Response preparation and sending
-              json response;
-              if (params.response_format == "json") {
-                  response = json::parse(result);
-              } else {
-                  response["text"] = result;
-              }
-
-
-
-              res_.set_content(response.dump(), "application/json");
-
-              auto total_end = std::chrono::steady_clock::now();
-              if (params.debug_mode) {
-                  std::cout << "[" << current_timestamp() << "] Request completed in "
-                            << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                total_end - total_start).count() << "ms\n";
-              }
-
-          } catch (const std::exception& e) {
-              auto error_time = std::chrono::steady_clock::now();
-              if (params.debug_mode) {
-                  std::cout << "[" << current_timestamp() << "] Error processing request after "
-                            << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                error_time - total_start).count()
-                            << "ms: " << e.what() << "\n";
-              }
-              res_.status = 500;
-              res_.set_content(R"({"error":"Internal server error"})", "application/json");
+              std::cout << "[" << current_timestamp() << "] Request completed. Final stats:\n"
+                        << thread_pool.get_stats() << "\n"
+                        << "Total request time: " << total_duration << "ms\n\n";
           }
       });
 

@@ -10,7 +10,7 @@ export const options = {
   scenarios: {
     burst: {
       executor: "shared-iterations",
-      vus: 4,
+      vus: 10,
       iterations: 100,
       maxDuration: "1m",
     },
