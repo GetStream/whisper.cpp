@@ -5,15 +5,14 @@ import { FormData } from "https://jslib.k6.io/formdata/0.0.2/index.js";
 // Load the binary audio file once to reuse across all virtual users
 const audioFile = open("../../samples/jfk.wav", "b"); // 11s audio sample
 
+// burst requests
 export const options = {
   scenarios: {
-    constant_load: {
-      executor: "constant-arrival-rate",
-      rate: 15, // 20 requests per second
-      timeUnit: "1s", // Defines the time unit for the arrival rate
-      duration: "1m", // Total duration of the test (adjust as needed)
-      preAllocatedVUs: 15, // Number of VUs to preallocate
-      maxVUs: 15, // Maximum number of VUs to allow
+    burst: {
+      executor: "shared-iterations",
+      vus: 4,
+      iterations: 100,
+      maxDuration: "1m",
     },
   },
 };
@@ -35,7 +34,7 @@ export default function () {
   fd.append("response_format", "json");
 
   // Perform the HTTP POST request with appropriate headers
-  const res = http.post("http://127.0.0.1:8081/inference", fd.body(), {
+  const res = http.post("http://127.0.0.1:8080/inference", fd.body(), {
     headers: { "Content-Type": "multipart/form-data; boundary=" + fd.boundary },
     timeout: "30s", // Set a timeout to prevent hanging requests (adjust as needed)
   });
