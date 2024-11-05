@@ -10,7 +10,7 @@ export const options = {
   scenarios: {
     burst: {
       executor: "shared-iterations",
-      vus: 10,
+      vus: 15,
       iterations: 100,
       maxDuration: "1m",
     },
@@ -34,7 +34,7 @@ export default function () {
   fd.append("response_format", "json");
 
   // Perform the HTTP POST request with appropriate headers
-  const res = http.post("http://127.0.0.1:8080/inference", fd.body(), {
+  const res = http.post("http://127.0.0.1:8081/inference", fd.body(), {
     headers: { "Content-Type": "multipart/form-data; boundary=" + fd.boundary },
     timeout: "30s", // Set a timeout to prevent hanging requests (adjust as needed)
   });
