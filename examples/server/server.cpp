@@ -37,6 +37,10 @@
 
 #include "thread_pool.h"
 
+#include <future>
+
+#include <map>
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267)
 #endif
@@ -54,6 +58,10 @@ namespace {
 }
 
 namespace whisper_server {
+
+  const int WATCHDOG_INTERVAL_MS = 1000; // How often watchdog checks
+  const int INSTANCE_TIMEOUT_MS = 30000; // Max time an instance can be in use
+  const int PROCESSING_TIMEOUT_MS = 60000; // Max time for processing audio
 
   struct server_params {
     std::string hostname = "127.0.0.1";
@@ -130,7 +138,7 @@ namespace whisper_server {
     cudaMemGetInfo( & available_memory, & total_memory);
     // remove 1164MiB to account for the memory used by the system
     // available_memory -= 1164 * 1024 * 1024;
-    int calculated_instances = static_cast<int>(available_memory / MODEL_MEMORY_USAGE);
+    int calculated_instances = static_cast < int > (available_memory / MODEL_MEMORY_USAGE);
     return std::max(1, std::min(15, calculated_instances));
     #elif defined(__APPLE__)
     // Fixed number for Apple devices
@@ -195,61 +203,78 @@ namespace whisper_server {
   };
 
   struct whisper_instance {
-    int id; // Unique identifier for the instance
+    int id;
     std::shared_ptr < WhisperContext > ctx;
     std::atomic < bool > in_use;
+    std::chrono::steady_clock::time_point last_use;
 
     whisper_instance(int id, std::shared_ptr < WhisperContext > c): id(id), ctx(std::move(c)), in_use(false) {}
   };
 
   class whisper_pool {
     public: whisper_pool(const whisper_params & params, int num_instances) {
-      std::cout << "[" << current_timestamp() << "] Initializing whisper pool with " <<
-        num_instances << " instances\n";
+        std::cout << "[" << current_timestamp() << "] Initializing whisper pool with " <<
+          num_instances << " instances\n";
 
-      for (int i = 0; i < num_instances; ++i) {
-        try {
-          auto instance = init_whisper(params, i); // Pass the instance ID
-          instances.emplace_back(std::move(instance));
-        } catch (const std::exception & e) {
-          std::cerr << "[" << current_timestamp() << "] Failed to initialize instance " <<
-            i << ": " << e.what() << "\n";
+        for (int i = 0; i < num_instances; ++i) {
+          try {
+            auto instance = init_whisper(params, i);
+            instances.emplace_back(std::move(instance));
+          } catch (const std::exception & e) {
+            std::cerr << "[" << current_timestamp() << "] Failed to initialize instance " <<
+              i << ": " << e.what() << "\n";
+          }
+        }
+
+        // Start watchdog thread
+        watchdog_thread = std::thread([this]() {
+          while (!exit_flag.load()) {
+            check_instances();
+            std::this_thread::sleep_for(std::chrono::milliseconds(WATCHDOG_INTERVAL_MS));
+          }
+        });
+
+        std::cout << "[" << current_timestamp() << "] Successfully initialized " <<
+          instances.size() << " instances\n";
+      }
+
+      ~whisper_pool() {
+        shutdown();
+      }
+
+    std::shared_ptr < whisper_instance > get_instance() {
+      std::unique_lock < std::mutex > lock(mutex);
+
+      condition.wait_for(lock,
+        std::chrono::milliseconds(INSTANCE_TIMEOUT_MS),
+        [this] {
+          return std::any_of(instances.begin(), instances.end(),
+            [](const std::shared_ptr < whisper_instance > & inst) {
+              return !inst -> in_use.load();
+            }) || exit_flag.load();
+        });
+
+      if (exit_flag.load()) {
+        return nullptr;
+      }
+
+      // Round-robin allocation
+      for (size_t i = 0; i < instances.size(); ++i) {
+        size_t index = (next_instance + i) % instances.size();
+        auto & inst = instances[index];
+        if (!inst -> in_use.exchange(true)) {
+          inst -> last_use = std::chrono::steady_clock::now();
+          next_instance = (index + 1) % instances.size();
+          return inst;
         }
       }
 
-      std::cout << "[" << current_timestamp() << "] Successfully initialized " <<
-        instances.size() << " instances\n";
-    }
-
-    std::shared_ptr<whisper_instance> get_instance() {
-        std::unique_lock<std::mutex> lock(mutex);
-
-        condition.wait(lock, [this] {
-            return std::any_of(instances.begin(), instances.end(),
-                [](const std::shared_ptr<whisper_instance>& inst) {
-                    return !inst->in_use.load();
-                }) || exit_flag.load();
-        });
-
-        if (exit_flag.load()) {
-            return nullptr;
-        }
-
-        // Round-robin allocation
-        for (size_t i = 0; i < instances.size(); ++i) {
-            size_t index = (next_instance + i) % instances.size();
-            auto& inst = instances[index];
-            if (!inst->in_use.exchange(true)) {
-                next_instance = (index + 1) % instances.size();
-                return inst;
-            }
-        }
-
-        // If no instance is found (which shouldn't happen), return nullptr
-        return nullptr;
+      return nullptr;
     }
 
     void release_instance(std::shared_ptr < whisper_instance > instance) {
+      if (!instance) return;
+
       instance -> in_use.store(false);
       condition.notify_one();
     }
@@ -257,14 +282,35 @@ namespace whisper_server {
     void shutdown() {
       exit_flag.store(true);
       condition.notify_all();
+
+      if (watchdog_thread.joinable()) {
+        watchdog_thread.join();
+      }
     }
 
-    private:
-        std::vector<std::shared_ptr<whisper_instance>> instances;
-        std::mutex mutex;
-        std::condition_variable condition;
-        int next_instance = 0; // Round-robin index
+    private: std::vector < std::shared_ptr < whisper_instance >> instances;
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::thread watchdog_thread;
+    int next_instance = 0;
 
+    void check_instances() {
+      std::unique_lock < std::mutex > lock(mutex);
+      auto now = std::chrono::steady_clock::now();
+
+      for (auto & instance: instances) {
+        if (instance -> in_use.load()) {
+          auto duration = std::chrono::duration_cast < std::chrono::milliseconds > (
+            now - instance -> last_use).count();
+
+          if (duration > INSTANCE_TIMEOUT_MS) {
+            std::cerr << "[" << current_timestamp() << "] Warning: Force releasing instance " <<
+              instance -> id << " after " << duration << "ms\n";
+            release_instance(instance);
+          }
+        }
+      }
+    }
 
     std::shared_ptr < whisper_instance > init_whisper(const whisper_params & params, int id) {
       whisper_context_params cparams = whisper_context_default_params();
@@ -278,7 +324,6 @@ namespace whisper_server {
       cparams.flash_attn = params.flash_attn;
 
       auto ctx = std::make_shared < WhisperContext > (params.model, cparams);
-
       return std::make_shared < whisper_instance > (id, ctx);
     }
   };
@@ -291,6 +336,15 @@ namespace whisper_server {
     std::promise < std::string > result_promise;
   };
 
+  // Add this structure to handle processing results
+  struct ProcessingResult {
+    bool success;
+    std::string result;
+    std::string error;
+    int64_t total_time_ms; // Total processing time
+    int64_t waiting_time_ms; // Time spent waiting for an instance
+    int64_t processing_time_ms; // Time spent in actual processing
+  };
 
   // Function to print usage/help information
   static void whisper_print_usage(int /*argc*/ , char ** argv,
@@ -512,37 +566,50 @@ namespace whisper_server {
     return true;
   }
 
-  static std::string process_audio(whisper_context * ctx,
+  static ProcessingResult process_audio(
+    whisper_context * ctx,
     const whisper_params & params,
       const std::vector < float > & pcmf32,
-        const std::vector < std::vector < float >> & /*pcmf32s*/ ) {
-    whisper_full_params wparams =
-      whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
-    wparams.print_realtime = false;
-    wparams.print_progress = false;
-    wparams.print_timestamps = !params.no_timestamps;
-    wparams.translate = params.translate;
-    wparams.language = params.language.c_str();
-    wparams.n_threads = params.n_threads;
-    wparams.offset_ms = params.offset_t_ms;
-    wparams.duration_ms = params.duration_ms;
+        const std::vector < std::vector < float >> & pcmf32s
+  ) {
+    ProcessingResult result;
 
-    if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(),
-        params.n_processors) != 0) {
-      throw std::runtime_error("Failed to process audio");
+    try {
+      whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+      wparams.print_realtime = false;
+      wparams.print_progress = false;
+      wparams.print_timestamps = !params.no_timestamps;
+      wparams.translate = params.translate;
+      wparams.language = params.language.c_str();
+      wparams.n_threads = params.n_threads;
+      wparams.offset_ms = params.offset_t_ms;
+      wparams.duration_ms = params.duration_ms;
+
+      if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(),
+          params.n_processors) != 0) {
+        result.success = false;
+        result.error = "Failed to process audio";
+        return result;
+      }
+
+      if (params.response_format == "json") {
+        json json_result = {
+          {
+            "text",
+            whisper_full_get_segment_text(ctx, 0)
+          }
+        };
+        result.result = json_result.dump();
+      } else {
+        result.result = whisper_full_get_segment_text(ctx, 0);
+      }
+      result.success = true;
+    } catch (const std::exception & e) {
+      result.success = false;
+      result.error = std::string("Processing error: ") + e.what();
     }
 
-    if (params.response_format == "json") {
-      json result = {
-        {
-          "text",
-          whisper_full_get_segment_text(ctx, 0)
-        }
-      };
-      return result.dump();
-    } else {
-      return whisper_full_get_segment_text(ctx, 0);
-    }
+    return result;
   }
 
 } // namespace whisper_server
@@ -561,13 +628,22 @@ int main(int argc, char ** argv) {
   std::signal(SIGTERM, signal_handler);
 
   int num_instances = calculate_num_instances(params);
-  auto pool = std::make_unique<whisper_pool>(params, num_instances);
+  auto pool = std::make_unique < whisper_pool > (params, num_instances);
 
   httplib::Server svr;
   svr.set_default_headers({
-    { "Server", "whisper.cpp" },
-    { "Access-Control-Allow-Origin", "*" },
-    { "Access-Control-Allow-Headers", "content-type, authorization" },
+    {
+      "Server",
+      "whisper.cpp"
+    },
+    {
+      "Access-Control-Allow-Origin",
+      "*"
+    },
+    {
+      "Access-Control-Allow-Headers",
+      "content-type, authorization"
+    },
   });
 
   int num_threads = num_instances * 3;
@@ -579,124 +655,139 @@ int main(int argc, char ** argv) {
 
   // POST /inference handler
   svr.Post(sparams.request_path + sparams.inference_path,
-      [&](const httplib::Request & req, httplib::Response & res) {
-          try {
-              // **1. Validate Request Parameters**
-
-              // Check if the 'file' field is present in the request
-              if (!req.has_file("file")) {
-                  res.status = 400; // Bad Request
-                  res.set_content(R"({"error":"Missing 'file' in request"})", "application/json");
-                  return;
-              }
-
-              auto audio_file = req.get_file_value("file");
-
-              // Check if the uploaded file exceeds the maximum allowed size
-              if (audio_file.content.size() > MAX_UPLOAD_SIZE) {
-                  res.status = 413; // Payload Too Large
-                  res.set_content(R"({"error":"File too large"})", "application/json");
-                  return;
-              }
-
-              // **2. Parse and Validate Audio Data**
-
-              std::vector<float> pcmf32;
-              std::vector<std::vector<float>> pcmf32s;
-
-              // Attempt to read and parse the WAV file
-              if (!::read_wav(audio_file.content, pcmf32, pcmf32s, params.diarize)) {
-                  res.status = 400; // Bad Request
-                  res.set_content(R"({"error":"Failed to read audio"})", "application/json");
-                  return;
-              }
-
-              // **3. Enqueue the Task to the ThreadPool**
-
-              // Capture necessary variables by value to ensure thread safety
-              auto future_result = thread_pool.enqueue([pool = pool.get(), pcmf32, pcmf32s, params]() -> std::string {
-                  // **3.1. Acquire a Whisper Instance from the Pool**
-                  auto instance = pool->get_instance();
-                  if (!instance) {
-                      return R"({"error":"No available instances"})";
-                  }
-
-                  std::string result;
-                  try {
-                      // **3.2. Log Instance Acquisition (Optional)**
-                      if (params.debug_mode) {
-                          std::cout << "[" << current_timestamp() << "] "
-                                    << "Instance " << instance->id << " acquired by thread "
-                                    << std::this_thread::get_id() << "\n";
-                      }
-
-                      // **3.3. Process the Audio**
-                      auto start = std::chrono::steady_clock::now();
-                      result = process_audio(instance->ctx->get(), params, pcmf32, pcmf32s);
-                      auto end = std::chrono::steady_clock::now();
-                      auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-
-                      // **3.4. Log Processing Time (Optional)**
-                      if (params.debug_mode) {
-                          std::cout << "[" << current_timestamp() << "] "
-                                    << "Task processed in " << duration_ms << " ms by instance "
-                                    << instance->id << "\n";
-                      }
-
-                  } catch (const std::exception &e) {
-                      // **3.5. Handle Exceptions During Processing**
-                      result = std::string(R"({"error":")") + e.what() + "\"}";
-                  }
-
-                  // **3.6. Release the Instance Back to the Pool**
-                  pool->release_instance(instance);
-
-                  // **3.7. Log Instance Release (Optional)**
-                  if (params.debug_mode) {
-                      std::cout << "[" << current_timestamp() << "] "
-                                << "Instance " << instance->id << " released by thread "
-                                << std::this_thread::get_id() << "\n";
-                  }
-
-                  return result;
-              });
-
-              // **4. Wait for the Task to Complete and Retrieve the Result**
-              std::string result = future_result.get();
-
-              // **5. Set the HTTP Response**
-              res.set_content(result, "application/json");
-
-          } catch (const std::exception &e) {
-              // **6. Handle Unexpected Exceptions**
-              res.status = 500; // Internal Server Error
-              res.set_content(R"({"error":"Internal server error"})", "application/json");
-
-              // **Optional: Log the Exception**
-              if (params.debug_mode) {
-                  std::cerr << "[" << current_timestamp() << "] "
-                            << "Exception in request handler: " << e.what() << "\n";
-              }
-          }
-      });
-
-    // Exception handler
-    svr.set_exception_handler([](const httplib::Request & , httplib::Response & res,
-      std::exception_ptr ep) {
+    [ & ](const httplib::Request & req, httplib::Response & res) {
       try {
-        std::rethrow_exception(ep);
+        if (!req.has_file("file")) {
+          res.status = 400;
+          res.set_content(R"({"error":"Missing 'file' in request"})", "application/json");
+          return;
+        }
+
+        auto audio_file = req.get_file_value("file");
+
+        if (audio_file.content.size() > MAX_UPLOAD_SIZE) {
+          res.status = 413;
+          res.set_content(R"({"error":"File too large"})", "application/json");
+          return;
+        }
+
+        std::vector < float > pcmf32;
+        std::vector < std::vector < float >> pcmf32s;
+
+        if (!::read_wav(audio_file.content, pcmf32, pcmf32s, params.diarize)) {
+          res.status = 400;
+          res.set_content(R"({"error":"Failed to read audio"})", "application/json");
+          return;
+        }
+
+        // Create a promise for the result
+        std::promise < ProcessingResult > result_promise;
+        auto result_future = result_promise.get_future();
+
+        // Process in thread pool with timeout
+        auto processing_task = thread_pool.enqueue([ & result_promise, pool = pool.get(),
+          pcmf32, pcmf32s, params
+        ]() {
+          auto instance = pool -> get_instance();
+          auto start_total = std::chrono::steady_clock::now();
+          auto start_wait = start_total;
+
+          auto end_wait = std::chrono::steady_clock::now();
+
+          if (!instance) {
+            ProcessingResult result;
+            result.success = false;
+            result.error = "No available instances";
+            result.waiting_time_ms = std::chrono::duration_cast < std::chrono::milliseconds > (
+              end_wait - start_wait).count();
+            result.total_time_ms = std::chrono::duration_cast < std::chrono::milliseconds > (
+              end_wait - start_total).count();
+            result.processing_time_ms = 0;
+            result_promise.set_value(result);
+            return;
+          }
+
+          try {
+            if (params.debug_mode) {
+              std::cout << "[" << current_timestamp() << "] Instance " << instance -> id <<
+                " acquired by thread " << std::this_thread::get_id() <<
+                " after waiting " << std::chrono::duration_cast < std::chrono::milliseconds > (
+                  end_wait - start_wait).count() << "ms\n";
+            }
+
+            auto start_process = std::chrono::steady_clock::now();
+            auto result = process_audio(instance -> ctx -> get(), params, pcmf32, pcmf32s);
+            auto end_process = std::chrono::steady_clock::now();
+
+            result.waiting_time_ms = std::chrono::duration_cast < std::chrono::milliseconds > (
+              end_wait - start_wait).count();
+            result.processing_time_ms = std::chrono::duration_cast < std::chrono::milliseconds > (
+              end_process - start_process).count();
+            result.total_time_ms = std::chrono::duration_cast < std::chrono::milliseconds > (
+              end_process - start_total).count();
+
+            if (params.debug_mode) {
+              std::cout << "[" << current_timestamp() << "] Processing completed by instance " <<
+                instance -> id << ":\n" <<
+                "  - Wait time: " << result.waiting_time_ms << "ms\n" <<
+                "  - Process time: " << result.processing_time_ms << "ms\n" <<
+                "  - Total time: " << result.total_time_ms << "ms\n";
+            }
+
+            result_promise.set_value(result);
+
+          } catch (const std::exception & e) {
+            ProcessingResult result;
+            result.success = false;
+            result.error = std::string("Processing error: ") + e.what();
+            result_promise.set_value(result);
+          }
+
+          pool -> release_instance(instance);
+
+          if (params.debug_mode) {
+            std::cout << "[" << current_timestamp() << "] Instance " << instance -> id <<
+              " released by thread " << std::this_thread::get_id() << "\n";
+          }
+        });
+
+        // Wait for result with timeout
+        auto status = result_future.wait_for(std::chrono::milliseconds(PROCESSING_TIMEOUT_MS));
+
+        if (status == std::future_status::timeout) {
+          res.status = 504; // Gateway Timeout
+          res.set_content(R"({"error":"Processing timeout"})", "application/json");
+          return;
+        }
+
+        auto result = result_future.get();
+        if (!result.success) {
+          res.status = 500;
+          res.set_content(
+              std::string(R"({"error":")") + result.error + "\"}",
+              "application/json"
+          );
+          return;
+        }
+
+        res.set_content(result.result, "application/json");
+
       } catch (const std::exception & e) {
-        res.status = 500; // Internal Server Error
-        res.set_content(std::string("{\"error\":\"") + e.what() + "\"}",
-          "application/json");
+        res.status = 500;
+        res.set_content(R"({"error":"Internal server error"})", "application/json");
+
+        if (params.debug_mode) {
+          std::cerr << "[" << current_timestamp() << "] Exception in request handler: " <<
+            e.what() << "\n";
+        }
       }
     });
 
-    // Error handler
-    svr.set_error_handler([](const httplib::Request & /*req*/ , httplib::Response & res) {
-      res.status = 404; // Not Found
-      res.set_content("{\"error\":\"Invalid request\"}", "application/json");
-    });
+  // Error handler
+  svr.set_error_handler([](const httplib::Request & /*req*/ , httplib::Response & res) {
+    res.status = 404; // Not Found
+    res.set_content("{\"error\":\"Invalid request\"}", "application/json");
+  });
 
   svr.set_read_timeout(sparams.read_timeout);
   svr.set_write_timeout(sparams.write_timeout);
@@ -711,8 +802,8 @@ int main(int argc, char ** argv) {
   // Restrict served files
   svr.set_mount_point("/", sparams.public_path.c_str());
 
-//print threds
-std::cout << "Number of threads: " << num_threads << std::endl;
+  //print threds
+  std::cout << "Number of threads: " << num_threads << std::endl;
   std::cout << "[" << current_timestamp() << "] Whisper server listening at http://" <<
     sparams.hostname << ":" << sparams.port << " with " << num_instances <<
     " model instances ("
@@ -726,7 +817,7 @@ std::cout << "Number of threads: " << num_threads << std::endl;
     << ")\n";
 
   // Start server in a separate thread
-  std::thread server_thread([&]() {
+  std::thread server_thread([ & ]() {
     if (!svr.listen_after_bind()) {
       std::cerr << "[" << current_timestamp() << "] Error starting server\n";
       exit_flag.store(true);
@@ -740,7 +831,7 @@ std::cout << "Number of threads: " << num_threads << std::endl;
 
   // Server shutdown
   svr.stop();
-  pool->shutdown();
+  pool -> shutdown();
   thread_pool.shutdown();
 
   // Join the server thread to ensure it has finished

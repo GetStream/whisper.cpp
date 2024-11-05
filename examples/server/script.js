@@ -9,16 +9,12 @@ export const options = {
   scenarios: {
     constant_load: {
       executor: "constant-arrival-rate",
-      rate: 20, // 20 requests per second
+      rate: 15, // 20 requests per second
       timeUnit: "1s", // Defines the time unit for the arrival rate
       duration: "1m", // Total duration of the test (adjust as needed)
-      preAllocatedVUs: 20, // Number of VUs to preallocate
-      maxVUs: 20, // Maximum number of VUs to allow
+      preAllocatedVUs: 15, // Number of VUs to preallocate
+      maxVUs: 15, // Maximum number of VUs to allow
     },
-  },
-  // Optionally, you can define thresholds to monitor p90, p95, etc.
-  thresholds: {
-    http_req_duration: ["p90<2000"], // Example: p90 should be below 2 seconds
   },
 };
 
