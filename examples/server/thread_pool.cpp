@@ -13,13 +13,11 @@ ThreadPool::ThreadPool(size_t threads) : stop(false) {
                     this->condition.wait(lock, [this] {
                         return this->stop || !this->tasks.empty();
                     });
-
                     if(this->stop && this->tasks.empty()) {
                         std::cout << "[" << get_current_time() << "] Worker " << thread_id
                                   << " shutting down\n";
                         return;
                     }
-
                     task = std::move(this->tasks.front());
                     this->tasks.pop();
                 }

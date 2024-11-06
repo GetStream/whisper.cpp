@@ -1,5 +1,6 @@
 #ifndef THREAD_POOL_H
 #define THREAD_POOL_H
+
 #include <condition_variable>
 #include <functional>
 #include <future>
@@ -24,23 +25,30 @@ public:
         -> std::future<typename std::result_of<F(Args...)>::type>
     {
         using return_type = typename std::result_of<F(Args...)>::type;
+
         auto task = std::make_shared<std::packaged_task<return_type()>>(
             std::bind(std::forward<F>(f), std::forward<Args>(args)...)
         );
+
         std::future<return_type> res = task->get_future();
+
+        // Convert any task type into void() type
+        auto wrapper = std::make_shared<std::packaged_task<void()>>(
+            [task]() { (*task)(); }
+        );
+
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
             if(stop) {
                 throw std::runtime_error("enqueue on stopped ThreadPool");
             }
-            tasks.emplace(task);
+            tasks.emplace(wrapper);
         }
         condition.notify_one();
         return res;
     }
 
     void shutdown();
-
 
 private:
     std::string get_current_time() const {
