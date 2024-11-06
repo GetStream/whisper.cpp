@@ -9,7 +9,7 @@ find_package(Threads REQUIRED)
 add_executable(${TARGET}
     server.cpp
     thread_pool.cpp
-    thread_pool.h     # Optional, for IDEs and clarity
+    thread_pool.h
     httplib.h
 )
 
@@ -24,8 +24,4 @@ target_link_libraries(${TARGET} PRIVATE
 
 if(WIN32)
     target_link_libraries(${TARGET} PRIVATE ws2_32)
-endif()
-
-if(WHISPER_CUDA)
-    add_definitions(-DWHISPER_CUDA)
 endif()

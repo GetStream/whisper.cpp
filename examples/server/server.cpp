@@ -1,4 +1,3 @@
-// Include necessary headers
 #include "common.h"
 
 #include "whisper.h"
@@ -45,19 +44,21 @@
 #pragma warning(disable: 4244 4267)
 #endif
 
-#if defined(WHISPER_CUDA)
-#include <cuda_runtime.h>
-#endif
 
 // Constants for configuration
 const size_t MAX_UPLOAD_SIZE = 10 * 1024 * 1024; // 10 MB max upload size
-const size_t MODEL_MEMORY_USAGE = 600 * 1024 * 1024; // 600 MB model memory usage
 
 namespace {
   using json = nlohmann::ordered_json;
 }
 
 namespace whisper_server {
+
+    template<typename T, typename... Args>
+    std::unique_ptr<T> make_unique(Args&&... args) {
+        return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
+    }
+
   const int PROCESSING_TIMEOUT_MS = 30000; // Max time for processing audio
 
   struct server_params {
@@ -65,6 +66,8 @@ namespace whisper_server {
     std::string public_path = "examples/server/public";
     std::string request_path = "";
     std::string inference_path = "/inference";
+    int32_t n_threads_http = std::min(4, static_cast < int32_t > (std::thread::hardware_concurrency()));
+
     int32_t port = 8080;
     int32_t read_timeout = 600;
     int32_t write_timeout = 600;
@@ -73,7 +76,11 @@ namespace whisper_server {
 
   struct whisper_params {
     int32_t n_threads = std::min(4, static_cast < int32_t > (std::thread::hardware_concurrency()));
+    // These are "Whisper" processors. It's a strategy that was explored to split the input audio into -p chunks and process the chunks in parallel. Sometimes it can speed-up the process, but the transcription result at the splits will likely be worse due to partial words and losing context.
+    // A rule of thumb is that -p * -t should be less or equal to the number of CPU cores that you have.
     int32_t n_processors = 1;
+    // number of whisper instances to run in parallel != processors
+    int32_t n_instances = 1;
     int32_t offset_t_ms = 0;
     int32_t offset_n = 0;
     int32_t duration_ms = 0;
@@ -127,22 +134,9 @@ namespace whisper_server {
   }
 
   // Calculate the number of instances based on available GPU memory
-  static int calculate_num_instances(const whisper_params & /*params*/ ) {
-    (void) MODEL_MEMORY_USAGE; // To prevent unused variable warning
-    #if defined(WHISPER_CUDA)
-    size_t available_memory = 0;
-    size_t total_memory = 0;
-    cudaMemGetInfo( & available_memory, & total_memory);
-    // remove 1164MiB to account for the memory used by the system
-    // available_memory -= 1164 * 1024 * 1024;
-    int calculated_instances = static_cast < int > (available_memory / MODEL_MEMORY_USAGE);
-    return std::max(1, std::min(15, calculated_instances));
-    #elif defined(__APPLE__)
-    // Fixed number for Apple devices
-    return 8;
-    #else
-    return std::max(1, static_cast < int > (std::thread::hardware_concurrency() / 2));
-    #endif
+  static int calculate_num_instances(const whisper_params &params ) {
+   // return num_instances
+   return params.n_instances;
   }
 
   static std::string current_timestamp() {
@@ -207,213 +201,128 @@ namespace whisper_server {
 
     whisper_instance(int id, std::shared_ptr < WhisperContext > c): id(id), ctx(std::move(c)), in_use(false) {}
   };
+  struct InstanceAvailablePred {
+          bool operator()(const std::shared_ptr<whisper_instance>& inst) const {
+              return !inst->in_use.load(std::memory_order_relaxed);
+          }
+      };
 
-  class whisper_pool {
-  public:
-      whisper_pool(const whisper_params& params, int num_instances) {
-          std::cout << "[" << current_timestamp() << "] Initializing whisper pool with "
-                   << num_instances << " instances\n";
+      class whisper_pool {
+      public:
+          whisper_pool(const whisper_params& params, int num_instances) {
+              std::cout << "[" << current_timestamp() << "] Initializing whisper pool with "
+                        << num_instances << " instances\n";
 
-          for (int i = 0; i < num_instances; ++i) {
-              try {
-                  auto instance = init_whisper(params, i);
-                  instances.emplace_back(std::move(instance));
-              } catch (const std::exception& e) {
-                  std::cerr << "[" << current_timestamp() << "] Failed to initialize instance "
-                           << i << ": " << e.what() << "\n";
+              for (int i = 0; i < num_instances; ++i) {
+                  try {
+                      auto instance = init_whisper(params, i);
+                      instances.emplace_back(std::move(instance));
+                  } catch (const std::exception& e) {
+                      std::cerr << "[" << current_timestamp() << "] Failed to initialize instance "
+                                << i << ": " << e.what() << "\n";
+                  }
               }
+
+              if (instances.empty()) {
+                  throw std::runtime_error("Failed to initialize any whisper instances");
+              }
+
+              // Store params for potential reinitialization
+              this->params = params;
+
+              std::cout << "[" << current_timestamp() << "] Successfully initialized "
+                        << instances.size() << " instances\n";
           }
 
-          if (instances.empty()) {
-              throw std::runtime_error("Failed to initialize any whisper instances");
+          ~whisper_pool() {
+              shutdown();
           }
 
-          // Store params for potential reinitialization
-          this->params = params;
+          std::shared_ptr<whisper_instance> get_instance() {
+              size_t attempts = 0;
+              const size_t max_attempts = instances.size();
 
-          // Start watchdog thread
-          watchdog_thread = std::thread([this]() {
-              while (!exit_flag.load(std::memory_order_relaxed)) {
-                  check_instances();
-                  std::this_thread::sleep_for(std::chrono::milliseconds(WATCHDOG_INTERVAL_MS));
-              }
-          });
+              while (attempts++ < max_attempts && !exit_flag.load(std::memory_order_relaxed)) {
+                  size_t current = next_instance.fetch_add(1, std::memory_order_relaxed) % instances.size();
 
-          std::cout << "[" << current_timestamp() << "] Successfully initialized "
-                   << instances.size() << " instances\n";
-      }
-
-      ~whisper_pool() {
-          shutdown();
-      }
-
-      std::shared_ptr<whisper_instance> get_instance() {
-          size_t attempts = 0;
-          const size_t max_attempts = instances.size();
-
-          while (attempts++ < max_attempts && !exit_flag.load(std::memory_order_relaxed)) {
-              // Try quick acquisition first
-              size_t current = next_instance.fetch_add(1, std::memory_order_relaxed) % instances.size();
-
-              auto& inst = instances[current];
-              bool expected = false;
-              if (inst->in_use.compare_exchange_strong(expected, true,
-                                                     std::memory_order_acquire)) {
-                  active_requests.fetch_add(1, std::memory_order_relaxed);
-                  inst->last_use = std::chrono::steady_clock::now();
-                  return inst;
-              }
-          }
-
-          // If quick acquisition failed, wait with timeout
-          std::unique_lock<std::mutex> lock(mutex);
-
-          auto pred = [this] {
-              return std::any_of(instances.begin(), instances.end(),
-                  [](const auto& inst) {
-                      return !inst->in_use.load(std::memory_order_relaxed);
-                  }) || exit_flag.load(std::memory_order_relaxed);
-          };
-
-          if (condition.wait_for(lock,
-              std::chrono::milliseconds(INSTANCE_TIMEOUT_MS), pred)) {
-
-              // Try one more time after waiting
-              for (size_t i = 0; i < instances.size(); ++i) {
-                  size_t index = (next_instance.fetch_add(1, std::memory_order_relaxed)) % instances.size();
-                  auto& inst = instances[index];
+                  auto& inst = instances[current];
                   bool expected = false;
-                  if (inst->in_use.compare_exchange_strong(expected, true,
-                                                         std::memory_order_acquire)) {
-                      active_requests.fetch_add(1, std::memory_order_relaxed);
+                  if (inst->in_use.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
                       inst->last_use = std::chrono::steady_clock::now();
                       return inst;
                   }
               }
-          }
 
-          return nullptr;
-      }
+              std::unique_lock<std::mutex> lock(mutex);
 
-      void release_instance(std::shared_ptr<whisper_instance> instance) {
-          if (!instance) return;
+              auto pred = [this]() -> bool {
+                  return std::any_of(instances.begin(), instances.end(), InstanceAvailablePred()) ||
+                         exit_flag.load(std::memory_order_relaxed);
+              };
 
-          instance->in_use.store(false, std::memory_order_release);
-          active_requests.fetch_sub(1, std::memory_order_relaxed);
-
-          // Notify waiting threads
-          {
-              std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
-              if (lock) condition.notify_one();
-          }
-      }
-
-      void shutdown() {
-          exit_flag.store(true, std::memory_order_release);
-          condition.notify_all();
-
-          if (watchdog_thread.joinable()) {
-              watchdog_thread.join();
-          }
-
-          // Force release all instances
-          for (auto& instance : instances) {
-              if (instance->in_use.load(std::memory_order_relaxed)) {
-                  release_instance(instance);
-              }
-          }
-      }
-
-      // Health monitoring methods
-      size_t get_active_requests() const {
-          return active_requests.load(std::memory_order_relaxed);
-      }
-
-      size_t get_instance_count() const {
-          return instances.size();
-      }
-
-      bool is_healthy() const {
-          size_t active = active_requests.load(std::memory_order_relaxed);
-          return active <= instances.size() && !instances.empty();
-      }
-
-  private:
-      std::vector<std::shared_ptr<whisper_instance>> instances;
-      std::mutex mutex;
-      std::condition_variable condition;
-      std::thread watchdog_thread;
-      std::atomic<size_t> next_instance{0};
-      std::atomic<size_t> active_requests{0};
-      std::atomic<bool> exit_flag{false};
-      whisper_params params;  // Store for reinitialization
-
-      // Constants
-      static constexpr int WATCHDOG_INTERVAL_MS = 1000;  // How often watchdog checks
-      static constexpr int INSTANCE_TIMEOUT_MS = 30000;  // Max time to wait for an instance
-      static constexpr int INSTANCE_MAX_USE_TIME_MS = 60000;  // Max time an instance can be in use
-
-      void check_instances() {
-          std::unique_lock<std::mutex> lock(mutex);
-          auto now = std::chrono::steady_clock::now();
-
-          for (size_t i = 0; i < instances.size(); ++i) {
-              auto& instance = instances[i];
-              if (instance->in_use.load(std::memory_order_relaxed)) {
-                  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      now - instance->last_use).count();
-
-                  if (duration > INSTANCE_MAX_USE_TIME_MS) {
-                      std::cerr << "[" << current_timestamp() << "] Warning: Force releasing instance "
-                               << instance->id << " after " << duration << "ms\n";
-
-                      try {
-                          // Try to reinitialize the hung instance
-                          auto new_instance = init_whisper(params, instance->id);
-                          release_instance(instance);  // Release the old instance
-                          instance = std::move(new_instance);  // Replace with new instance
-                      } catch (const std::exception& e) {
-                          std::cerr << "[" << current_timestamp() << "] Failed to reinitialize instance "
-                                   << instance->id << ": " << e.what() << "\n";
-                          release_instance(instance);  // Just release if reinitialization fails
+              if (condition.wait_for(lock, std::chrono::milliseconds(INSTANCE_TIMEOUT_MS), pred)) {
+                  for (size_t i = 0; i < instances.size(); ++i) {
+                      size_t index = (next_instance.fetch_add(1, std::memory_order_relaxed)) % instances.size();
+                      auto& inst = instances[index];
+                      bool expected = false;
+                      if (inst->in_use.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
+                          inst->last_use = std::chrono::steady_clock::now();
+                          return inst;
                       }
                   }
               }
+
+              return nullptr;
           }
-      }
 
-      std::shared_ptr<whisper_instance> init_whisper(const whisper_params& params, int id) {
-          whisper_context_params cparams = whisper_context_default_params();
-          #if defined(WHISPER_CUDA)
-          cparams.use_gpu = true;
-          #elif defined(__APPLE__)
-          cparams.use_gpu = true;
-          #else
-          cparams.use_gpu = false;
-          #endif
-          cparams.flash_attn = params.flash_attn;
+          void release_instance(std::shared_ptr<whisper_instance> instance) {
+              if (!instance) return;
 
-          auto ctx = std::make_shared<WhisperContext>(params.model, cparams);
-          return std::make_shared<whisper_instance>(id, ctx);
-      }
-  };
+              instance->in_use.store(false, std::memory_order_release);
 
-  struct server_task {
-    int id;
-    whisper_params params;
-    std::vector < float > pcmf32;
-    std::vector < std::vector < float >> pcmf32s;
-    std::promise < std::string > result_promise;
-  };
+              // Notify waiting threads
+              {
+                  std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+                  if (lock) condition.notify_one();
+              }
+          }
 
-  struct ProcessingResult {
-      bool success = false;
-      std::string result;
-      std::string error;
-      int64_t waiting_time_ms = 0;
-      int64_t processing_time_ms = 0;
-      int64_t total_time_ms = 0;
-  };
+          void shutdown() {
+              exit_flag.store(true, std::memory_order_release);
+              condition.notify_all();
+
+              // Force release all instances
+              for (auto& instance : instances) {
+                  if (instance->in_use.load(std::memory_order_relaxed)) {
+                      release_instance(instance);
+                  }
+              }
+          }
+
+
+          size_t get_instance_count() const {
+              return instances.size();
+          }
+
+      private:
+          std::vector<std::shared_ptr<whisper_instance>> instances;
+          std::mutex mutex;
+          std::condition_variable condition;
+          std::atomic<size_t> next_instance{0};
+          std::atomic<bool> exit_flag{false};
+          whisper_params params;  // Store for reinitialization
+
+          static constexpr int INSTANCE_TIMEOUT_MS = 30000;  // Max time to wait for an instance
+
+          std::shared_ptr<whisper_instance> init_whisper(const whisper_params& params, int id) {
+              whisper_context_params cparams = whisper_context_default_params();
+              cparams.use_gpu = params.use_gpu;
+              cparams.flash_attn = params.flash_attn;
+
+              auto ctx = std::make_shared<WhisperContext>(params.model, cparams);
+              return std::make_shared<whisper_instance>(id, ctx);
+          }
+      };
 
   // Function to print usage/help information
   static void whisper_print_usage(int /*argc*/ , char ** argv,
@@ -426,6 +335,7 @@ namespace whisper_server {
     fprintf(stderr, "  -h,        --help              [default] show this help message and exit\n");
     fprintf(stderr, "  -t N,      --threads N         [%-7d] number of threads to use during computation\n", params.n_threads);
     fprintf(stderr, "  -p N,      --processors N      [%-7d] number of processors to use during computation\n", params.n_processors);
+    fprintf(stderr, "  -i N,      --instances N       [%-7d] number of whisper instances to use\n", params.n_instances);
     fprintf(stderr, "  -ot N,     --offset-t N        [%-7d] time offset in milliseconds\n", params.offset_t_ms);
     fprintf(stderr, "  -on N,     --offset-n N        [%-7d] segment index offset\n", params.offset_n);
     fprintf(stderr, "  -d  N,     --duration N        [%-7d] duration of audio to process in milliseconds\n", params.duration_ms);
@@ -456,6 +366,7 @@ namespace whisper_server {
     // server params
     fprintf(stderr, "  -dtw MODEL --dtw MODEL         [%-7s] compute token-level timestamps\n", params.dtw.c_str());
     fprintf(stderr, "  --host HOST,                   [%-7s] Hostname/ip-address for the server\n", sparams.hostname.c_str());
+    fprintf(stderr, "  --ht N,    --http-threads N     [%-7d] number of threads to use for HTTP server\n", sparams.n_threads_http);
     fprintf(stderr, "  --port PORT,                   [%-7d] Port number for the server\n", sparams.port);
     fprintf(stderr, "  --public PATH,                 [%-7s] Path to the public folder\n", sparams.public_path.c_str());
     fprintf(stderr, "  --request-path PATH,           [%-7s] Request path for all requests\n", sparams.request_path.c_str());
@@ -549,6 +460,8 @@ namespace whisper_server {
         params.n_threads = std::stoi(argv[++i]);
       } else if (arg == "-p" || arg == "--processors") {
         params.n_processors = std::stoi(argv[++i]);
+      } else if (arg == "-i" || arg == "--instances") {
+        params.n_instances = std::stoi(argv[++i]);
       } else if (arg == "-ot" || arg == "--offset-t") {
         params.offset_t_ms = std::stoi(argv[++i]);
       } else if (arg == "-on" || arg == "--offset-n") {
@@ -623,7 +536,10 @@ namespace whisper_server {
         sparams.request_path = argv[++i];
       } else if (arg == "--inference-path") {
         sparams.inference_path = argv[++i];
-      } else if (arg == "--convert") {
+      } else if (arg == "--http-threads" || arg == "-ht") {
+        sparams.n_threads_http = std::stoi(argv[++i]);
+      }
+      else if (arg == "--convert") {
         sparams.ffmpeg_converter = true;
       } else {
         fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
@@ -635,7 +551,6 @@ namespace whisper_server {
     return true;
   }
 
-  // Then modify process_audio to return a string instead of ProcessingResult
   static std::string process_audio(
       whisper_context* ctx,
       const whisper_params& params,
@@ -683,11 +598,11 @@ int main(int argc, char ** argv) {
   std::signal(SIGTERM, signal_handler);
 
   int num_instances = calculate_num_instances(params);
-  auto pool = std::make_unique < whisper_pool > (params, num_instances);
+  auto pool = make_unique < whisper_pool > (params, num_instances);
 
   httplib::Server svr;
   // Set number of threads for request handling
-  svr.new_task_queue = [] { return new httplib::ThreadPool(24); };
+  svr.new_task_queue = [&sparams] { return new httplib::ThreadPool(sparams.n_threads_http); };
   svr.set_default_headers({
     {
       "Server",
@@ -703,7 +618,7 @@ int main(int argc, char ** argv) {
     },
   });
 
-  int num_threads = num_instances * 3;
+  int num_threads = num_instances;
   // Create a thread pool with a suitable number of threads
   ThreadPool thread_pool(num_threads);
 
@@ -712,128 +627,89 @@ int main(int argc, char ** argv) {
 
   // POST /inference handler
   svr.Post(sparams.request_path + sparams.inference_path,
-      [&](const httplib::Request& req_, httplib::Response& res_) {
-          const auto request_start = std::chrono::steady_clock::now();
+          [&](const httplib::Request& req_, httplib::Response& res_) {
+              const auto request_start = std::chrono::steady_clock::now();
 
-          // Log initial state before processing
-          if (params.debug_mode) {
-              std::cout << "[" << current_timestamp() << "] POST " << sparams.inference_path << "\n"
-                        << thread_pool.get_stats() << "\n";
-          }
-
-          // Parse request and prepare data before queuing
-          if (!req_.has_file("file")) {
-              res_.status = 400;
-              res_.set_content(R"({"error":"Missing 'file' in request"})", "application/json");
-              return;
-          }
-
-          const auto audio_file = req_.get_file_value("file");
-          if (audio_file.content.size() > MAX_UPLOAD_SIZE) {
-              res_.status = 413;
-              res_.set_content(R"({"error":"File too large"})", "application/json");
-              return;
-          }
-
-          // Parse WAV data
-          std::vector<float> pcmf32;
-          std::vector<std::vector<float>> pcmf32s;
-          if (!::read_wav(audio_file.content, pcmf32, pcmf32s, params.diarize)) {
-              res_.status = 400;
-              res_.set_content(R"({"error":"Failed to read audio"})", "application/json");
-              return;
-          }
-
-          // Create promise/future for the result
-          std::promise<json> result_promise;
-          auto result_future = result_promise.get_future();
-
-          // Now enqueue the actual processing work
-          const auto queue_start = std::chrono::steady_clock::now();
-
-          thread_pool.enqueue([queue_start,
-                             request_start,
-                             pcmf32 = std::move(pcmf32),
-                             pcmf32s = std::move(pcmf32s),
-                             &pool,
-                             &params,
-                             result_promise = std::move(result_promise)]() mutable {
-              try {
-                  // Try to acquire a whisper instance
-                  auto instance = pool->get_instance();
-                  if (!instance) {
-                      json error_response = {
-                          {"error", "No available instances"},
-                          {"status", 503}
-                      };
-                      result_promise.set_value(error_response);
-                      return;
-                  }
-
-                  const auto processing_start = std::chrono::steady_clock::now();
-                  auto queue_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      processing_start - queue_start).count();
-
-                  // Process audio
-                  auto process_result = process_audio(instance->ctx->get(), params, pcmf32, pcmf32s);
-
-                  // Release the instance
-                  pool->release_instance(instance);
-
-                  const auto processing_end = std::chrono::steady_clock::now();
-                  auto processing_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      processing_end - processing_start).count();
-
-                  // Prepare response with timing information
-                  json response;
-                  if (params.response_format == "json") {
-                      response = json::parse(process_result);
-                  } else {
-                      response["text"] = process_result;
-                  }
-
-                  response["queue_time_ms"] = queue_time;
-                  response["processing_time_ms"] = processing_time;
-                  response["total_time_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      processing_end - request_start).count();
-                  response["status"] = 200;
-
-                  result_promise.set_value(response);
-
-              } catch (const std::exception& e) {
-                  result_promise.set_value({
-                      {"error", "Internal server error"},
-                      {"status", 500}
-                  });
+              if (!req_.has_file("file")) {
+                  res_.status = 400;
+                  res_.set_content(R"({"error":"Missing 'file' in request"})", "application/json");
+                  return;
               }
+
+              const auto audio_file = req_.get_file_value("file");
+              if (audio_file.content.size() > MAX_UPLOAD_SIZE) {
+                  res_.status = 413;
+                  res_.set_content(R"({"error":"File too large"})", "application/json");
+                  return;
+              }
+
+              std::vector<float> pcmf32;
+              std::vector<std::vector<float>> pcmf32s;
+              if (!::read_wav(audio_file.content, pcmf32, pcmf32s, params.diarize)) {
+                  res_.status = 400;
+                  res_.set_content(R"({"error":"Failed to read audio"})", "application/json");
+                  return;
+              }
+
+              std::promise<json> result_promise;
+              std::future<json> result_future = result_promise.get_future();
+
+              const auto queue_start = std::chrono::steady_clock::now();
+
+              // Create shared pointers for moved values
+              auto p_pcmf32 = std::make_shared<std::vector<float>>(std::move(pcmf32));
+              auto p_pcmf32s = std::make_shared<std::vector<std::vector<float>>>(std::move(pcmf32s));
+              auto p_promise = std::make_shared<std::promise<json>>(std::move(result_promise));
+
+              thread_pool.enqueue([queue_start, request_start, p_pcmf32, p_pcmf32s, &pool, &params, p_promise]() {
+                  try {
+                      auto instance = pool->get_instance();
+                      if (!instance) {
+                          json error_response = {
+                              {"error", "No available instances"},
+                              {"status", 503}
+                          };
+                          p_promise->set_value(error_response);
+                          return;
+                      }
+                      auto process_result = process_audio(instance->ctx->get(), params, *p_pcmf32, *p_pcmf32s);
+
+                      pool->release_instance(instance);
+
+
+                      json response;
+                      if (params.response_format == "json") {
+                          response = json::parse(process_result);
+                      } else {
+                          response["text"] = process_result;
+                      }
+
+                      response["status"] = 200;
+
+                      p_promise->set_value(response);
+
+                  } catch (const std::exception& e) {
+                      p_promise->set_value({
+                          {"error", "Internal server error"},
+                          {"status", 500}
+                      });
+                  }
+              });
+
+              if (result_future.wait_for(std::chrono::milliseconds(PROCESSING_TIMEOUT_MS))
+                  == std::future_status::timeout) {
+                  res_.status = 504;
+                  res_.set_content(R"({"error":"Processing timeout"})", "application/json");
+                  return;
+              }
+
+              json result = result_future.get();
+              int status = result["status"].get<int>();
+              result.erase("status");
+
+              res_.status = status;
+              res_.set_content(result.dump(), "application/json");
           });
-
-          // Wait for the result with timeout
-          if (result_future.wait_for(std::chrono::milliseconds(PROCESSING_TIMEOUT_MS))
-              == std::future_status::timeout) {
-              res_.status = 504;
-              res_.set_content(R"({"error":"Processing timeout"})", "application/json");
-              return;
-          }
-
-          // Get the result and send response
-          json result = result_future.get();
-          int status = result["status"].get<int>();
-          result.erase("status");
-
-          res_.status = status;
-          res_.set_content(result.dump(), "application/json");
-
-          // Final stats after processing
-          if (params.debug_mode) {
-              const auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - request_start).count();
-
-              std::cout << "[" << current_timestamp() << "] Request completed. Final stats:\n"
-                        << thread_pool.get_stats() << "\n"
-                        << "Total request time: " << total_duration << "ms\n\n";
-          }
-      });
 
   // Error handler
   svr.set_error_handler([](const httplib::Request & /*req*/ , httplib::Response & res) {
@@ -858,15 +734,7 @@ int main(int argc, char ** argv) {
   std::cout << "Number of threads: " << num_threads << std::endl;
   std::cout << "[" << current_timestamp() << "] Whisper server listening at http://" <<
     sparams.hostname << ":" << sparams.port << " with " << num_instances <<
-    " model instances ("
-#if defined(WHISPER_CUDA)
-              << "CUDA enabled"
-#elif defined(__APPLE__)
-              << "Metal enabled"
-#else
-    << "CPU only"
-#endif
-    << ")\n";
+    " model instances";
 
   // Start server in a separate thread
   std::thread server_thread([ & ]() {
