@@ -54,19 +54,9 @@ namespace {
 
 namespace whisper_server {
 
-    // Specialization for arrays with known size
-    template<typename T>
-    typename std::enable_if<std::is_array<T>::value && std::extent<T>::value != 0,
-                          std::unique_ptr<T>>::type
-    make_unique(std::size_t) = delete;
-
-    // Specialization for arrays with unknown size
-    template<typename T>
-    typename std::enable_if<std::is_array<T>::value && std::extent<T>::value == 0,
-                          std::unique_ptr<T>>::type
-    make_unique(std::size_t n) {
-        typedef typename std::remove_extent<T>::type U;
-        return std::unique_ptr<T>(new U[n]());
+    template<typename T, typename... Args>
+    std::unique_ptr<T> make_unique(Args&&... args) {
+        return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
     }
 
   const int PROCESSING_TIMEOUT_MS = 30000; // Max time for processing audio
