@@ -26,8 +26,6 @@ using namespace whisper;
 
 namespace {
 
-    std::unique_ptr<WhisperContextPool::Instance> instance;
-
 // Pre-allocate buffers for audio processing
 struct AudioBuffers {
     std::vector<float> pcmf32;
@@ -38,9 +36,8 @@ struct AudioBuffers {
         pcmf32s.reserve(2); // Stereo
     }
 };
-
-// Use a thread-local pool of pre-allocated buffers
-static thread_local std::vector<AudioBuffers> buffer_pool;
+// Use a thread-local pre-allocated buffer
+static thread_local std::unique_ptr<AudioBuffers> buffer_pool;
 
 void whisper_print_usage(int /*argc*/, char ** argv, const whisper::params & params, const whisper::server_params & sparams) {
     fprintf(stderr, "\n");
@@ -459,6 +456,7 @@ int main(int argc, char ** argv) {
     if (sparams.ffmpeg_converter) {
         check_ffmpeg_availibility();
     }
+
     // whisper init
     struct whisper_context_params cparams = whisper_context_default_params();
 
@@ -668,13 +666,8 @@ int main(int argc, char ** argv) {
 
         // Enqueue the processing task with timeout
         auto future = thread_pool.enqueue([&]() {
-            // Get or create thread-local buffer pool
-            if (buffer_pool.empty()) {
-                buffer_pool.emplace_back();
-            }
-            
-            // Get buffer from pool
-            AudioBuffers& buffers = buffer_pool.back();
+            // Get buffer from thread-local storage
+            thread_local AudioBuffers buffers;
             buffers.pcmf32.clear();
             buffers.pcmf32s.clear();
 
@@ -982,6 +975,7 @@ int main(int argc, char ** argv) {
         }
 
         // clean up
+        auto instance = whisper_pool->get_instance();
         whisper_free(instance->ctx);
 
         // whisper init

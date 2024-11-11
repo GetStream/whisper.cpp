@@ -68,6 +68,11 @@ private:
         PaddedContext& operator=(const PaddedContext&) = delete;
     };
 
+    std::vector<PaddedContext> contexts;
+    std::vector<size_t> in_use_indices;
+    std::unique_ptr<LockFreeQueue<size_t>> available_indices;
+    std::mutex pool_mutex;
+
 public:
     WhisperContextPool(size_t num_instances, const std::string& model_path, const whisper_context_params& params) {
         if (num_instances == 0) {
@@ -92,6 +97,7 @@ public:
         // Try to get an available context index
         for (int attempt = 0; attempt < 5; attempt++) {
             if (available_indices->try_pop(idx)) {
+                std::lock_guard<std::mutex> lock(pool_mutex);
                 auto instance = std::make_shared<Instance>();
                 instance->ctx = contexts[idx].context->get();
                 in_use_indices.push_back(idx);
@@ -99,31 +105,60 @@ public:
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1 << attempt));
         }
-        throw std::runtime_error("No available whisper contexts");
+        return nullptr;
     }
 
     void release_instance(std::shared_ptr<Instance>& instance) {
         if (!instance) return;
 
+        std::lock_guard<std::mutex> lock(pool_mutex);
         // Find and remove the context index from in_use list
         for (auto it = in_use_indices.begin(); it != in_use_indices.end(); ++it) {
             if (contexts[*it].context->get() == instance->ctx) {
                 available_indices->push(*it);
                 in_use_indices.erase(it);
                 instance.reset();
-                return;  // Add return here to exit after finding the match
+                return;
             }
         }
     }
 
-    void reset() {
+    bool load_model(const std::string& model_path, const whisper_context_params& params) {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        
+        try {
+            std::vector<PaddedContext> new_contexts;
+            new_contexts.reserve(contexts.size());
+            
+            for (size_t i = 0; i < contexts.size(); i++) {
+                PaddedContext ctx;
+                ctx.context = std::unique_ptr<WhisperContext>(
+                    new WhisperContext(model_path, params)
+                );
+                ctx.core_affinity = i % std::thread::hardware_concurrency();
+                new_contexts.push_back(std::move(ctx));
+            }
+
+            contexts = std::move(new_contexts);
+            
+            // Reset available indices
+            available_indices.reset(new LockFreeQueue<size_t>());
+            for (size_t i = 0; i < contexts.size(); i++) {
+                available_indices->push(i);
+            }
+            in_use_indices.clear();
+            
+            return true;
+        } catch (const std::exception& e) {
+            fprintf(stderr, "Failed to load model: %s\n", e.what());
+            return false;
+        }
+    }
+
+    ~WhisperContextPool() {
+        std::lock_guard<std::mutex> lock(pool_mutex);
         contexts.clear();
         in_use_indices.clear();
         available_indices.reset();
     }
-
-private:
-    std::vector<PaddedContext> contexts;
-    std::vector<size_t> in_use_indices;
-    std::unique_ptr<LockFreeQueue<size_t>> available_indices;
 };

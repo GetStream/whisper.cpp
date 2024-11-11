@@ -9,6 +9,7 @@
 #include <random>
 #include <atomic>
 #include <memory>
+#include <chrono>
 
 template<typename T>
 class LockFreeQueue {
@@ -107,9 +108,9 @@ public:
     WorkStealingThreadPool(size_t num_threads) : queues(num_threads), stop(false) {
         for (size_t i = 0; i < num_threads; ++i) {
             workers.emplace_back([this, i] {
-                std::random_device rd;
-                std::mt19937 gen(rd());
-                std::uniform_int_distribution<size_t> dist(0, queues.size() - 1);
+                static constexpr size_t MAX_STEAL_ATTEMPTS = 3;
+                static constexpr std::chrono::microseconds MIN_BACKOFF(1);
+                static constexpr std::chrono::microseconds MAX_BACKOFF(100);
 
                 while (true) {
                     std::function<void()> task;
@@ -120,18 +121,22 @@ public:
                         found_task = true;
                     }
 
-                    // If no task in own queue, try to steal from others
+                    // If no task in own queue, try to steal with exponential backoff
                     if (!found_task) {
-                        for (size_t attempt = 0; attempt < queues.size() - 1; ++attempt) {
-                            size_t victim = dist(gen);
-                            if (victim == i) {
-                                continue;
-                            }
-
+                        auto backoff = MIN_BACKOFF;
+                        
+                        for (size_t attempt = 0; attempt < MAX_STEAL_ATTEMPTS; ++attempt) {
+                            // Deterministic stealing pattern
+                            size_t victim = (i + attempt + 1) % queues.size();
+                            
                             if (queues[victim].try_pop(task)) {
                                 found_task = true;
                                 break;
                             }
+
+                            // Exponential backoff between steal attempts
+                            std::this_thread::sleep_for(backoff);
+                            backoff = std::min(backoff * 2, MAX_BACKOFF);
                         }
                     }
 
