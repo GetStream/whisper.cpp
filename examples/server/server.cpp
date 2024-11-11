@@ -524,8 +524,9 @@ int main(int argc, char ** argv) {
     std::atomic<bool> should_exit{false};
 
 #ifdef _WIN32
-    signal(SIGINT, [](int) { should_exit.store(true); });
-    signal(SIGTERM, [](int) { should_exit.store(true); });
+    #include <signal.h>
+    signal(SIGINT, [&should_exit](int) { should_exit.store(true); });
+    signal(SIGTERM, [&should_exit](int) { should_exit.store(true); });
 #else
     struct sigaction sa;
     sa.sa_handler = SIG_DFL;
