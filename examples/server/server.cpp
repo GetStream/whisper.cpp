@@ -28,6 +28,20 @@ namespace {
 
     std::unique_ptr<WhisperContextPool::Instance> instance;
 
+// Pre-allocate buffers for audio processing
+struct AudioBuffers {
+    std::vector<float> pcmf32;
+    std::vector<std::vector<float>> pcmf32s;
+    
+    AudioBuffers() {
+        pcmf32.reserve(WHISPER_SAMPLE_RATE * 30); // 30 seconds
+        pcmf32s.reserve(2); // Stereo
+    }
+};
+
+// Use a thread-local pool of pre-allocated buffers
+static thread_local std::vector<AudioBuffers> buffer_pool;
+
 void whisper_print_usage(int /*argc*/, char ** argv, const whisper::params & params, const whisper::server_params & sparams) {
     fprintf(stderr, "\n");
     fprintf(stderr, "usage: %s [options] \n", argv[0]);
@@ -509,16 +523,19 @@ int main(int argc, char ** argv) {
     }
 
     // Initialize thread pool for processing requests
-    CustomThreadPool thread_pool(sparams.num_instances);
+    WorkStealingThreadPool thread_pool(sparams.num_instances);
 
     // Configure the server
     Server svr;
-    svr.new_task_queue = [&sparams] { return new httplib::ThreadPool(sparams.http_threads); };
+    //svr.new_task_queue = [&sparams] { return new httplib::ThreadPool(sparams.http_threads); };
     svr.set_default_headers({{"Server", "whisper.cpp"},
                              {"Access-Control-Allow-Origin", "*"},
                              {"Access-Control-Allow-Headers", "content-type, authorization"}});
     // Set payload size limit
     svr.set_payload_max_length(sparams.max_upload_size);
+    // Configure server for better performance
+    svr.set_keep_alive_max_count(1000);
+    svr.set_tcp_nodelay(true);
 
     // Setup signal handling for graceful shutdown
     std::atomic<bool> should_exit{false};
@@ -628,6 +645,11 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        // Ensure instance is released when we're done, even if there's an error
+        auto cleanup = std::shared_ptr<void>(nullptr, [&](void*) {
+            whisper_pool->release_instance(instance);
+        });
+
         // first check user requested fields of the request
         if (!req.has_file("file"))
         {
@@ -646,9 +668,15 @@ int main(int argc, char ** argv) {
 
         // Enqueue the processing task with timeout
         auto future = thread_pool.enqueue([&]() {
-            // audio arrays
-            std::vector<float> pcmf32;               // mono-channel F32 PCM
-            std::vector<std::vector<float>> pcmf32s; // stereo-channel F32 PCM
+            // Get or create thread-local buffer pool
+            if (buffer_pool.empty()) {
+                buffer_pool.emplace_back();
+            }
+            
+            // Get buffer from pool
+            AudioBuffers& buffers = buffer_pool.back();
+            buffers.pcmf32.clear();
+            buffers.pcmf32s.clear();
 
             if (sparams.ffmpeg_converter) {
                 // if file is not wav, convert to wav
@@ -667,7 +695,7 @@ int main(int argc, char ** argv) {
                 }
 
                 // read wav content into pcmf32
-                if (!::read_wav(temp_filename, pcmf32, pcmf32s, instance->params.diarize))
+                if (!::read_wav(temp_filename, buffers.pcmf32, buffers.pcmf32s, instance->params.diarize))
                 {
                     fprintf(stderr, "error: failed to read WAV file '%s'\n", temp_filename.c_str());
                     const std::string error_resp = "{\"error\":\"failed to read WAV file\"}";
@@ -678,7 +706,7 @@ int main(int argc, char ** argv) {
                 // remove temp file
                 std::remove(temp_filename.c_str());
             } else {
-                if (!::read_wav(audio_file.content, pcmf32, pcmf32s, instance->params.diarize))
+                if (!::read_wav(audio_file.content, buffers.pcmf32, buffers.pcmf32s, instance->params.diarize))
                 {
                     fprintf(stderr, "error: failed to read WAV file\n");
                     const std::string error_resp = "{\"error\":\"failed to read WAV file\"}";
@@ -710,7 +738,7 @@ int main(int argc, char ** argv) {
                     instance->params.language = "auto";
                 }
                 fprintf(stderr, "%s: processing '%s' (%d samples, %.1f sec), %d threads, %d processors, lang = %s, task = %s, %stimestamps = %d ...\n",
-                        __func__, filename.c_str(), int(pcmf32.size()), float(pcmf32.size())/WHISPER_SAMPLE_RATE,
+                        __func__, filename.c_str(), int(buffers.pcmf32.size()), float(buffers.pcmf32.size())/WHISPER_SAMPLE_RATE,
                         instance->params.n_threads, instance->params.n_processors,
                         instance->params.language.c_str(),
                         instance->params.translate ? "translate" : "transcribe",
@@ -761,7 +789,7 @@ int main(int argc, char ** argv) {
                 wparams.no_timestamps    = instance->params.no_timestamps;
                 wparams.token_timestamps = !instance->params.no_timestamps && instance->params.response_format == whisper::vjson_format;
 
-                whisper_print_user_data user_data = { &instance->params, &pcmf32s, 0 };
+                whisper_print_user_data user_data = { &instance->params, &buffers.pcmf32s, 0 };
 
                 // this callback is called on each new segment
                 if (instance->params.print_realtime) {
@@ -799,7 +827,7 @@ int main(int argc, char ** argv) {
                     wparams.abort_callback_user_data = &is_aborted;
                 }
 
-                if (whisper_full_parallel(instance->ctx, wparams, pcmf32.data(), pcmf32.size(), instance->params.n_processors) != 0) {
+                if (whisper_full_parallel(instance->ctx, wparams, buffers.pcmf32.data(), buffers.pcmf32.size(), instance->params.n_processors) != 0) {
                     fprintf(stderr, "%s: failed to process audio\n", argv[0]);
                     const std::string error_resp = "{\"error\":\"failed to process audio\"}";
                     res.set_content(error_resp, "application/json");
@@ -810,7 +838,7 @@ int main(int argc, char ** argv) {
             // return results to user
             if (instance->params.response_format == text_format)
             {
-                std::string results = output_str(instance->ctx, instance->params, pcmf32s);
+                std::string results = output_str(instance->ctx, instance->params, buffers.pcmf32s);
                 res.set_content(results.c_str(), "text/html; charset=utf-8");
             }
             else if (instance->params.response_format == srt_format)
@@ -823,9 +851,9 @@ int main(int argc, char ** argv) {
                     const int64_t t1 = whisper_full_get_segment_t1(instance->ctx, i);
                     std::string speaker = "";
 
-                    if (instance->params.diarize && pcmf32s.size() == 2)
+                    if (instance->params.diarize && buffers.pcmf32s.size() == 2)
                     {
-                        speaker = estimate_diarization_speaker(pcmf32s, t0, t1);
+                        speaker = estimate_diarization_speaker(buffers.pcmf32s, t0, t1);
                     }
 
                     ss << i + 1 + instance->params.offset_n << "\n";
@@ -845,9 +873,9 @@ int main(int argc, char ** argv) {
                     const int64_t t1 = whisper_full_get_segment_t1(instance->ctx, i);
                     std::string speaker = "";
 
-                    if (instance->params.diarize && pcmf32s.size() == 2)
+                    if (instance->params.diarize && buffers.pcmf32s.size() == 2)
                     {
-                        speaker = estimate_diarization_speaker(pcmf32s, t0, t1, true);
+                        speaker = estimate_diarization_speaker(buffers.pcmf32s, t0, t1, true);
                         speaker.insert(0, "<v Speaker");
                         speaker.append(">");
                     }
@@ -858,11 +886,11 @@ int main(int argc, char ** argv) {
                 res.set_content(ss.str(), "text/vtt");
             } else if (instance->params.response_format == vjson_format) {
                 /* try to match openai/whisper's Python format */
-                std::string results = output_str(instance->ctx, instance->params, pcmf32s);
+                std::string results = output_str(instance->ctx, instance->params, buffers.pcmf32s);
                 json jres = json{
                     {"task", instance->params.translate ? "translate" : "transcribe"},
                     {"language", whisper_lang_str_full(whisper_full_lang_id(instance->ctx))},
-                    {"duration", float(pcmf32.size())/WHISPER_SAMPLE_RATE},
+                    {"duration", float(buffers.pcmf32.size())/WHISPER_SAMPLE_RATE},
                     {"text", results},
                     {"segments", json::array()}
                 };
@@ -914,7 +942,7 @@ int main(int argc, char ** argv) {
             // TODO add more output formats
             else
             {
-                std::string results = output_str(instance->ctx, instance->params, pcmf32s);
+                std::string results = output_str(instance->ctx, instance->params, buffers.pcmf32s);
                 json jres = json{
                     {"text", results}
                 };

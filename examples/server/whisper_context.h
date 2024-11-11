@@ -3,10 +3,13 @@
 #include "whisper.h"
 #include "whisper_params.h"
 #include <memory>
-#include <mutex>
 #include <atomic>
-#include <condition_variable>
+#include <thread>
+#include <chrono>
+#include <mutex>
+#include <queue>
 using namespace whisper;
+
 // RAII wrapper for whisper_context
 class WhisperContext {
 public:
@@ -33,7 +36,7 @@ private:
     whisper_context* ctx;
 };
 
-// Thread-safe pool of whisper contexts with round-robin allocation
+// Thread-safe pool of whisper contexts using lock-free queue
 class WhisperContextPool {
 public:
     struct Instance {
@@ -42,69 +45,85 @@ public:
         whisper::params default_params;
     };
 
+private:
+    struct PaddedContext {
+        std::unique_ptr<WhisperContext> context;
+        uint32_t core_affinity;
+        char padding[32];
+
+        PaddedContext() = default;
+        PaddedContext(PaddedContext&& other) noexcept 
+            : context(std::move(other.context))
+            , core_affinity(other.core_affinity) {}
+
+        PaddedContext& operator=(PaddedContext&& other) noexcept {
+            if (this != &other) {
+                context = std::move(other.context);
+                core_affinity = other.core_affinity;
+            }
+            return *this;
+        }
+
+        PaddedContext(const PaddedContext&) = delete;
+        PaddedContext& operator=(const PaddedContext&) = delete;
+    };
+
+public:
     WhisperContextPool(size_t num_instances, const std::string& model_path, const whisper_context_params& params) {
         if (num_instances == 0) {
             throw std::invalid_argument("Pool must have at least one instance");
         }
-        
+
         contexts.reserve(num_instances);
+        available_indices.reset(new LockFreeQueue<size_t>());
+
+        // Initialize contexts with CPU affinity
         for (size_t i = 0; i < num_instances; i++) {
-            contexts.push_back(std::unique_ptr<WhisperContext>(new WhisperContext(model_path, params)));
+            PaddedContext ctx;
+            ctx.context = std::unique_ptr<WhisperContext>(new WhisperContext(model_path, params));
+            ctx.core_affinity = i % std::thread::hardware_concurrency();
+            contexts.push_back(std::move(ctx));
+            available_indices->push(i);
         }
     }
 
-    // Get next available instance
     std::shared_ptr<Instance> get_instance() {
-        std::unique_lock<std::mutex> lock(mutex);
-        
-        // Wait if shutdown is in progress
-        cv.wait(lock, [this]() { return !shutting_down; });
-
-        if (is_shutdown) {
-            throw std::runtime_error("Context pool has been shut down");
+        size_t idx;
+        // Try to get an available context index
+        for (int attempt = 0; attempt < 5; attempt++) {
+            if (available_indices->try_pop(idx)) {
+                auto instance = std::make_shared<Instance>();
+                instance->ctx = contexts[idx].context->get();
+                in_use_indices.push_back(idx);
+                return instance;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1 << attempt));
         }
-        
-        // Get current context and advance to next
-        auto instance = std::make_shared<Instance>();
-        instance->ctx = contexts[current_idx]->get();
-        current_idx = (current_idx + 1) % contexts.size();
-        active_operations++;
-        
-        return instance;
+        throw std::runtime_error("No available whisper contexts");
     }
 
-    // Release an instance back to the pool
     void release_instance(std::shared_ptr<Instance>& instance) {
-        std::unique_lock<std::mutex> lock(mutex);
-        active_operations--;
-        if (shutting_down && active_operations == 0) {
-            cv.notify_all();
+        if (!instance) return;
+
+        // Find and remove the context index from in_use list
+        for (auto it = in_use_indices.begin(); it != in_use_indices.end(); ++it) {
+            if (contexts[*it].context->get() == instance->ctx) {
+                available_indices->push(*it);
+                in_use_indices.erase(it);
+                instance.reset();
+                return;  // Add return here to exit after finding the match
+            }
         }
     }
 
-    // Gracefully reset the pool
     void reset() {
-        std::unique_lock<std::mutex> lock(mutex);
-        shutting_down = true;
-        
-        // Wait for any ongoing operations to complete
-        cv.wait(lock, [this]() { 
-            return active_operations == 0; 
-        });
-
-        // Clear all contexts
         contexts.clear();
-        is_shutdown = true;
-        
-        cv.notify_all();
+        in_use_indices.clear();
+        available_indices.reset();
     }
 
 private:
-    std::vector<std::unique_ptr<WhisperContext>> contexts;
-    std::mutex mutex;
-    std::condition_variable cv;
-    size_t current_idx = 0; // Index for round-robin allocation
-    std::atomic<size_t> active_operations{0};
-    bool shutting_down = false;
-    bool is_shutdown = false;
+    std::vector<PaddedContext> contexts;
+    std::vector<size_t> in_use_indices;
+    std::unique_ptr<LockFreeQueue<size_t>> available_indices;
 };

@@ -1,32 +1,163 @@
 #pragma once
 
 #include <vector>
-#include <queue>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <random>
+#include <atomic>
+#include <memory>
 
-class CustomThreadPool {
+template<typename T>
+class LockFreeQueue {
+    struct Node {
+        std::shared_ptr<T> data;
+        std::atomic<Node*> next;
+        
+        Node() : next(nullptr) {}
+        explicit Node(const T& value) : data(std::make_shared<T>(value)), next(nullptr) {}
+    };
+
+    std::atomic<Node*> head;
+    std::atomic<Node*> tail;
+    std::atomic<size_t> size_;
+
 public:
-    CustomThreadPool(size_t num_threads) : stop(false) {
+    LockFreeQueue() : size_(0) {
+        Node* dummy = new Node();
+        head.store(dummy);
+        tail.store(dummy);
+    }
+
+    ~LockFreeQueue() {
+        Node* current = head.load();
+        while (current) {
+            Node* next = current->next.load();
+            delete current;
+            current = next;
+        }
+    }
+
+    void push(const T& value) {
+        Node* new_node = new Node(value);
+        size_.fetch_add(1, std::memory_order_relaxed);
+        
+        while (true) {
+            Node* last = tail.load(std::memory_order_acquire);
+            Node* next = last->next.load(std::memory_order_acquire);
+            
+            if (last == tail.load(std::memory_order_acquire)) {
+                if (next == nullptr) {
+                    if (last->next.compare_exchange_weak(next, new_node,
+                                                       std::memory_order_release,
+                                                       std::memory_order_relaxed)) {
+                        tail.compare_exchange_strong(last, new_node,
+                                                   std::memory_order_release,
+                                                   std::memory_order_relaxed);
+                        return;
+                    }
+                } else {
+                    tail.compare_exchange_strong(last, next,
+                                               std::memory_order_release,
+                                               std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+
+    bool try_pop(T& result) {
+        while (true) {
+            Node* first = head.load(std::memory_order_acquire);
+            Node* last = tail.load(std::memory_order_acquire);
+            Node* next = first->next.load(std::memory_order_acquire);
+            
+            if (first == head.load(std::memory_order_acquire)) {
+                if (first == last) {
+                    if (next == nullptr) {
+                        return false;
+                    }
+                    tail.compare_exchange_strong(last, next,
+                                               std::memory_order_release,
+                                               std::memory_order_relaxed);
+                } else {
+                    if (next->data) {
+                        result = *(next->data);
+                        
+                        if (head.compare_exchange_weak(first, next,
+                                                     std::memory_order_release,
+                                                     std::memory_order_relaxed)) {
+                            size_.fetch_sub(1, std::memory_order_relaxed);
+                            delete first;
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    size_t size() const { return size_.load(std::memory_order_relaxed); }
+    bool empty() const { return size() == 0; }
+};
+
+class WorkStealingThreadPool {
+public:
+    WorkStealingThreadPool(size_t num_threads) : queues(num_threads), stop(false) {
         for (size_t i = 0; i < num_threads; ++i) {
-            workers.emplace_back([this] {
+            workers.emplace_back([this, i] {
+                std::random_device rd;
+                std::mt19937 gen(rd());
+                std::uniform_int_distribution<size_t> dist(0, queues.size() - 1);
+
                 while (true) {
                     std::function<void()> task;
-                    {
-                        std::unique_lock<std::mutex> lock(queue_mutex);
-                        condition.wait(lock, [this] {
-                            return stop || !tasks.empty();
-                        });
-                        if (stop && tasks.empty()) {
-                            return;
-                        }
-                        task = std::move(tasks.front());
-                        tasks.pop();
+                    bool found_task = false;
+
+                    // First try to get task from own queue
+                    if (queues[i].try_pop(task)) {
+                        found_task = true;
                     }
-                    task();
+
+                    // If no task in own queue, try to steal from others
+                    if (!found_task) {
+                        for (size_t attempt = 0; attempt < queues.size() - 1; ++attempt) {
+                            size_t victim = dist(gen);
+                            if (victim == i) {
+                                continue;
+                            }
+
+                            if (queues[victim].try_pop(task)) {
+                                found_task = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // If still no task, wait for notification
+                    if (!found_task) {
+                        std::unique_lock<std::mutex> lock(wait_mutex);
+                        condition.wait(lock, [this, &task, &found_task, i] {
+                            if (stop && are_all_queues_empty()) {
+                                return true;
+                            }
+                            if (queues[i].try_pop(task)) {
+                                found_task = true;
+                                return true;
+                            }
+                            return false;
+                        });
+                    }
+
+                    if (stop && !found_task && are_all_queues_empty()) {
+                        return;
+                    }
+
+                    if (found_task) {
+                        task();
+                        condition.notify_one();
+                    }
                 }
             });
         }
@@ -42,54 +173,60 @@ public:
         );
         
         std::future<return_type> res = task->get_future();
+
+        // Use round-robin instead of random assignment
+        static size_t next_queue = 0;
+        size_t queue_idx;
         {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            if (stop) {
-                throw std::runtime_error("enqueue on stopped CustomThreadPool");
-            }
-            tasks.emplace([task](){ (*task)(); });
+            std::unique_lock<std::mutex> lock(wait_mutex);
+            queue_idx = next_queue;
+            next_queue = (next_queue + 1) % queues.size();
         }
-        condition.notify_one();
+
+        if (stop) {
+            throw std::runtime_error("enqueue on stopped WorkStealingThreadPool");
+        }
+        
+        queues[queue_idx].push([task](){ (*task)(); });
+        condition.notify_all();
         return res;
     }
 
     void shutdown() {
-        // First prevent any new tasks from being enqueued
         {
-            std::unique_lock<std::mutex> lock(queue_mutex);
+            std::unique_lock<std::mutex> lock(wait_mutex);
             stop = true;
         }
         
-        // Wake up all worker threads
         condition.notify_all();
         
-        // Wait for all tasks to complete and threads to exit
         for (std::thread &worker : workers) {
             if (worker.joinable()) {
                 worker.join();
             }
         }
-
-        // Clear any remaining tasks
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            while (!tasks.empty()) {
-                tasks.pop();
-            }
-        }
     }
 
-    ~CustomThreadPool() {
+    ~WorkStealingThreadPool() {
         if (!stop) {
             shutdown();
         }
     }
 
 private:
+    bool are_all_queues_empty() {
+        for (auto& queue : queues) {
+            if (!queue.empty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     std::vector<std::thread> workers;
-    std::queue<std::function<void()>> tasks;
+    std::vector<LockFreeQueue<std::function<void()>>> queues;
     
-    std::mutex queue_mutex;
+    std::mutex wait_mutex;
     std::condition_variable condition;
     bool stop;
-}; 
+};

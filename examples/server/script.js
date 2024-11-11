@@ -9,11 +9,11 @@ export const options = {
   scenarios: {
     constant_load: {
       executor: "constant-arrival-rate",
-      rate: 4, // 20 requests per second
+      rate: 8, // 20 requests per second
       timeUnit: "1s", // Defines the time unit for the arrival rate
       duration: "1m", // Total duration of the test (adjust as needed)
-      preAllocatedVUs: 4, // Number of VUs to preallocate
-      maxVUs: 4, // Maximum number of VUs to allow
+      preAllocatedVUs: 8, // Number of VUs to preallocate
+      maxVUs: 8, // Maximum number of VUs to allow
     },
   },
 };
