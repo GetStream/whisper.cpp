@@ -5,6 +5,11 @@ env:
   ubuntu_image: "ubuntu:22.04"
   VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
 jobs:
   ubuntu-latest:
     runs-on: ubuntu-latest
