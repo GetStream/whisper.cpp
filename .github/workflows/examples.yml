@@ -9,6 +9,9 @@ on:
       - examples/addon.node/**
       - whisper.h
 
+permissions:
+  contents: read
+
 jobs:
   addon_node-ubuntu-latest:
     runs-on: ubuntu-latest

@@ -61,6 +61,9 @@ on:
       - scripts/get-flags.mk
       - examples/dr_wav.h
 
+permissions:
+  contents: read
+
 jobs:
   ubuntu-latest:
     runs-on: ubuntu-latest

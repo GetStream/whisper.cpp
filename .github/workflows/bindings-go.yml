@@ -9,6 +9,9 @@ on:
       - bindings/go/**
       - whisper.h
 
+permissions:
+  contents: read
+
 jobs:
   ubuntu-latest:
     runs-on: ubuntu-latest
